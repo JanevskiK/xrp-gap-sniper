@@ -1,3 +1,5 @@
+TRADING_ENABLED = False
+
 import os
 import time
 from decimal import Decimal
