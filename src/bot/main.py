@@ -1,3 +1,4 @@
+print("Starting Container", flush=True)
 
 import os
 import time
