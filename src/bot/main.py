@@ -1,4 +1,3 @@
-TRADING_ENABLED = False
 
 import os
 import time
