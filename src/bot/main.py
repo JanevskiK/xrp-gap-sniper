@@ -1,352 +1,321 @@
 import os
 import time
-import math
-import requests
 from decimal import Decimal, getcontext
+from typing import Dict, Tuple, Optional
+
+import requests
+from dotenv import load_dotenv
+
+# Only needed for LIVE trading
+from stellar_sdk import (
+    Keypair,
+    Network,
+    Server,
+    TransactionBuilder,
+    Asset,
+)
+from stellar_sdk.exceptions import BadRequestError, NotFoundError
 
 getcontext().prec = 28
-
-# -----------------------------
-# Env helpers
-# -----------------------------
-
-def env_str(name: str, default: str = "") -> str:
-    v = os.getenv(name, default)
-    return v.strip() if isinstance(v, str) else str(v)
-
-def env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return float(default)
-    return float(v)
-
-def env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    s = str(v).strip().lower()
-    return s in ("1", "true", "yes", "y", "on")
-
-def D(x) -> Decimal:
-    return Decimal(str(x))
-
-# -----------------------------
-# Config (variables)
-# -----------------------------
-
-HORIZON_URL = env_str("HORIZON_URL", "https://horizon.stellar.org")
-
-# Pair
-BASE_CODE = env_str("BASE_CODE", "XLM")      # native
-BASE_ISSUER = env_str("BASE_ISSUER", "")     # empty for native
-
-QUOTE_CODE = env_str("QUOTE_CODE", "USDC")
-QUOTE_ISSUER = env_str("QUOTE_ISSUER", "")   # required for USDC on Stellar
-
-# Trigger range in percent (e.g. 0.08 means 0.08%)
-MIN_TRIGGER_PCT = env_float("MIN_TRIGGER_PCT", 0.08)
-MAX_TRIGGER_PCT = env_float("MAX_TRIGGER_PCT", 0.13)
-
-# Loop cadence
-POLL_SEC = env_float("POLL_SEC", 1.0)
-SUMMARY_SEC = env_float("SUMMARY_SEC", 300.0)
-
-# Paper-trade sizing & behavior
-TRADE_USDC = env_float("TRADE_USDC", 10.0)  # how much USDC per "trade"
-HOLD_SECONDS = env_float("HOLD_SECONDS", 8.0)
-SELL_DELAY_SECONDS = env_float("SELL_DELAY_SECONDS", 3.0)
-SELL_TIMEOUT_SECONDS = env_float("SELL_TIMEOUT_SECONDS", 8.0)
-
-# Pricing & cost model
-INSIDE_PCT = env_float("INSIDE_PCT", 0.002)  # 0.2% (0.002) recommended
-FEE_PCT = env_float("FEE_PCT", 0.02)         # 2% conservative buffer
-
-# Safety: live trading disabled by default
-TRADING_ENABLED = env_bool("TRADING_ENABLED", False)
+D = Decimal
 
 
 # -----------------------------
-# Stellar/Horizon asset params
-# Horizon uses:
-#   native: asset_type=native
-#   credit: asset_type=credit_alphanum4 / credit_alphanum12 + asset_code + asset_issuer
-# For order_book/trades endpoints:
-#   selling_asset_* and buying_asset_* (or base/counter on some SDKs)
-# We'll use the canonical Horizon parameter names:
-#   selling_asset_type, selling_asset_code, selling_asset_issuer
-#   buying_asset_type, buying_asset_code, buying_asset_issuer
+# ENV / CONFIG
 # -----------------------------
+load_dotenv()
 
-def asset_type_from_code(code: str) -> str:
-    # XLM is native
-    if code.upper() == "XLM":
-        return "native"
-    # Horizon needs alphanum4 or alphanum12
-    L = len(code)
-    if 1 <= L <= 4:
-        return "credit_alphanum4"
-    if 5 <= L <= 12:
-        return "credit_alphanum12"
-    raise ValueError(f"Invalid asset code length for {code!r}")
+HORIZON_URL = os.getenv("HORIZON_URL", "https://horizon.stellar.org").strip()
 
-def add_asset_params(params: dict, prefix: str, code: str, issuer: str):
+BASE_CODE = os.getenv("BASE_CODE", "XLM").strip()
+BASE_ISSUER = os.getenv("BASE_ISSUER", "").strip()  # MUST be empty for XLM
+
+QUOTE_CODE = os.getenv("QUOTE_CODE", "USDC").strip()
+QUOTE_ISSUER = os.getenv("QUOTE_ISSUER", "").strip()
+
+MIN_TRIGGER_PCT = D(os.getenv("MIN_TRIGGER_PCT", "0.08"))  # percent
+MAX_TRIGGER_PCT = D(os.getenv("MAX_TRIGGER_PCT", "0.13"))  # percent
+
+POLL_SEC = float(os.getenv("POLL_SEC", "1.0"))
+
+# Option A parameters
+TRADE_USDC = D(os.getenv("TRADE_USDC", "10"))  # how much USDC to use per cycle
+HOLD_SECONDS = int(os.getenv("HOLD_SECONDS", "8"))  # how long to wait between buy and sell
+FEE_PCT = D(os.getenv("FEE_PCT", "0.02"))  # percent safety margin (slippage/fees buffer)
+
+TRADING_ENABLED = os.getenv("TRADING_ENABLED", "false").lower() in ("1", "true", "yes", "y")
+
+# For LIVE trading
+SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
+PUBLIC_KEY = os.getenv("PUBLIC_KEY", "").strip()  # optional; derived from secret if not set
+
+SUMMARY_SEC = int(os.getenv("SUMMARY_SEC", "300"))  # periodic summary prints
+
+
+# -----------------------------
+# ASSET HELPERS
+# -----------------------------
+def horizon_asset_params(prefix: str, code: str, issuer: str) -> Dict[str, str]:
     """
-    prefix is either 'selling' or 'buying'
+    Build Horizon params for /order_book which uses selling_* and buying_*.
+
+    For native XLM:
+      {prefix}_asset_type=native
+    For credit assets:
+      {prefix}_asset_type=credit_alphanum4 or credit_alphanum12
+      {prefix}_asset_code=...
+      {prefix}_asset_issuer=...
     """
-    code = (code or "").strip()
-    issuer = (issuer or "").strip()
+    if code.upper() == "XLM" and issuer == "":
+        return {f"{prefix}_asset_type": "native"}
 
-    at = asset_type_from_code(code)
-    params[f"{prefix}_asset_type"] = at
+    if not issuer:
+        raise ValueError(f"{prefix} issuer is empty for non-native asset code={code}")
 
-    if at != "native":
-        if not code:
-            raise ValueError(f"{prefix}: code is required for non-native asset")
-        if not issuer:
-            raise ValueError(f"{prefix}: issuer is required for non-native asset")
-        params[f"{prefix}_asset_code"] = code
-        params[f"{prefix}_asset_issuer"] = issuer
+    asset_type = "credit_alphanum4" if len(code) <= 4 else "credit_alphanum12"
+    return {
+        f"{prefix}_asset_type": asset_type,
+        f"{prefix}_asset_code": code,
+        f"{prefix}_asset_issuer": issuer,
+    }
 
-def pair_label() -> str:
-    return f"{BASE_CODE.upper()}/{QUOTE_CODE.upper()}"
 
-# We interpret "BASE/QUOTE" as:
-# - selling = BASE (XLM)
-# - buying  = QUOTE (USDC)
-# This matches the idea: use order_book to view XLM/USDC price.
-def build_orderbook_params() -> dict:
+def sdk_asset(code: str, issuer: str) -> Asset:
+    if code.upper() == "XLM" and issuer == "":
+        return Asset.native()
+    return Asset(code, issuer)
+
+
+# -----------------------------
+# MARKET DATA
+# -----------------------------
+def fetch_order_book() -> Dict:
+    """
+    GET /order_book?selling_asset_type=...&buying_asset_type=...
+    We'll treat BASE as "selling" and QUOTE as "buying" so price is QUOTE per BASE.
+    For XLM/USDC => price is USDC per XLM.
+    """
     params = {}
-    add_asset_params(params, "selling", BASE_CODE, BASE_ISSUER)
-    add_asset_params(params, "buying", QUOTE_CODE, QUOTE_ISSUER)
-    return params
+    params.update(horizon_asset_params("selling", BASE_CODE, BASE_ISSUER))
+    params.update(horizon_asset_params("buying", QUOTE_CODE, QUOTE_ISSUER))
 
-def build_trades_params(order="desc", limit=1) -> dict:
-    params = {}
-    add_asset_params(params, "selling", BASE_CODE, BASE_ISSUER)
-    add_asset_params(params, "buying", QUOTE_CODE, QUOTE_ISSUER)
-    params["order"] = order
-    params["limit"] = int(limit)
-    return params
-
-
-# -----------------------------
-# Horizon fetchers
-# -----------------------------
-
-def fetch_order_book() -> dict:
-    """
-    Horizon /order_book gives:
-      bids: [{price, amount, ...}]
-      asks: [{price, amount, ...}]
-    price here is "price of selling asset in terms of buying asset"
-    For selling=XLM, buying=USDC => price is USDC per XLM
-    """
     url = f"{HORIZON_URL.rstrip('/')}/order_book"
-    params = build_orderbook_params()
-    r = requests.get(url, params=params, timeout=10)
+    r = requests.get(url, params=params, timeout=15)
     r.raise_for_status()
     return r.json()
 
-def fetch_latest_trade_token() -> str | None:
+
+def best_bid_ask(order_book: Dict) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+    bids = order_book.get("bids", [])
+    asks = order_book.get("asks", [])
+    if not bids or not asks:
+        return None, None
+
+    # Horizon returns price as string
+    bid = D(bids[0]["price"])  # highest bid
+    ask = D(asks[0]["price"])  # lowest ask
+    return bid, ask
+
+
+def spread_pct(bid: Decimal, ask: Decimal) -> Decimal:
+    # percent
+    if ask <= 0:
+        return D("0")
+    return (ask - bid) / ask * D("100")
+
+
+def in_trigger_range(sp: Decimal) -> bool:
+    return MIN_TRIGGER_PCT <= sp <= MAX_TRIGGER_PCT
+
+
+# -----------------------------
+# LIVE TRADING (Option A)
+# -----------------------------
+def load_trading_keys() -> Tuple[str, str]:
+    if not SECRET_KEY:
+        raise ValueError("SECRET_KEY is required when TRADING_ENABLED=true")
+
+    kp = Keypair.from_secret(SECRET_KEY)
+    pub = PUBLIC_KEY or kp.public_key
+    return kp.secret, pub
+
+
+def submit_path_payment_strict_send(
+    server: Server,
+    source_secret: str,
+    source_public: str,
+    send_asset: Asset,
+    send_amount: Decimal,
+    dest_asset: Asset,
+    dest_min: Decimal,
+    memo_text: str = "gap-bot",
+) -> str:
     """
-    Gets the latest trade and returns paging_token (cursor).
-    Using requests params prevents malformed URLs (your crash).
+    A "market-style" swap:
+    - spend exactly send_amount of send_asset
+    - receive at least dest_min of dest_asset
     """
-    url = f"{HORIZON_URL.rstrip('/')}/trades"
-    params = build_trades_params(order="desc", limit=1)
+    account = server.load_account(source_public)
 
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        recs = data.get("_embedded", {}).get("records", [])
-        if not recs:
-            return None
-        return recs[0].get("paging_token")
-    except requests.RequestException as e:
-        print(f"Error fetching latest trade token: {e}")
-        return None
-
-
-# -----------------------------
-# Math helpers
-# -----------------------------
-
-def spread_pct(best_bid: Decimal, best_ask: Decimal) -> Decimal:
-    if best_ask <= 0:
-        return D(0)
-    return (best_ask - best_bid) / best_ask * D(100)
-
-def in_trigger_range(sp_pct: Decimal) -> bool:
-    return D(MIN_TRIGGER_PCT) <= sp_pct <= D(MAX_TRIGGER_PCT)
-
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
-
-
-# -----------------------------
-# PAPER trading simulation
-# -----------------------------
-
-class PaperStats:
-    def __init__(self):
-        self.trades = 0
-        self.wins = 0
-        self.losses = 0
-        self.pnl_usdc = D(0)
-        self.gross_usdc = D(0)
-        self.fees_usdc = D(0)
-
-    def record(self, pnl: Decimal, gross: Decimal, fees: Decimal):
-        self.trades += 1
-        self.pnl_usdc += pnl
-        self.gross_usdc += gross
-        self.fees_usdc += fees
-        if pnl >= 0:
-            self.wins += 1
-        else:
-            self.losses += 1
-
-    def summary_line(self) -> str:
-        avg = (self.pnl_usdc / D(self.trades)) if self.trades else D(0)
-        return (
-            f"[SUMMARY] trades={self.trades} wins={self.wins} losses={self.losses} "
-            f"pnl={self.pnl_usdc:.6f} USDC (avg {avg:.6f}) "
-            f"gross={self.gross_usdc:.6f} fees={self.fees_usdc:.6f}"
+    tx = (
+        TransactionBuilder(
+            source_account=account,
+            network_passphrase=Network.PUBLIC_NETWORK_PASSPHRASE,
+            base_fee=200,  # slightly above minimum
         )
-
-
-def paper_buy_sell(best_bid: Decimal, best_ask: Decimal, stats: PaperStats):
-    """
-    Option A (your request):
-      if spread triggers -> BUY then SELL after a few seconds
-    In paper-mode we simulate:
-      buy_price  ~ best_ask adjusted inside
-      sell_price ~ best_bid adjusted inside
-    """
-    inside = D(INSIDE_PCT) * D(100)  # convert 0.002 -> 0.2% (as percent)
-    fee_pct = D(FEE_PCT)
-
-    # Buy slightly better than ask (inside)
-    buy_price = best_ask * (D(1) - D(INSIDE_PCT))
-    # Sell slightly better than bid (inside)
-    sell_price = best_bid * (D(1) + D(INSIDE_PCT))
-
-    # Use TRADE_USDC as quote size
-    quote_in = D(TRADE_USDC)
-    if buy_price <= 0:
-        return
-
-    base_bought = quote_in / buy_price  # XLM amount in paper
-
-    # Wait / hold (simulate time exposure)
-    time.sleep(float(HOLD_SECONDS))
-    time.sleep(float(SELL_DELAY_SECONDS))
-
-    # Simulate sell proceeds
-    quote_out = base_bought * sell_price
-
-    # Conservative fee model: apply fee_pct to both legs
-    fees = (quote_in * fee_pct) + (quote_out * fee_pct)
-    gross = quote_out - quote_in
-    pnl = gross - fees
-
-    stats.record(pnl=pnl, gross=gross, fees=fees)
-
-    print(
-        f"[PAPER TRADE] buy@{buy_price:.7f} sell@{sell_price:.7f} "
-        f"in={quote_in:.4f} out={quote_out:.4f} gross={gross:.6f} "
-        f"fees={fees:.6f} pnl={pnl:.6f}"
+        .add_text_memo(memo_text[:28])
+        .append_path_payment_strict_send_op(
+            destination=source_public,  # self
+            send_asset=send_asset,
+            send_amount=str(send_amount),
+            dest_asset=dest_asset,
+            dest_min=str(dest_min),
+            path=[],
+        )
+        .set_timeout(60)
+        .build()
     )
 
+    tx.sign(Keypair.from_secret(source_secret))
+    resp = server.submit_transaction(tx)
+    return resp["hash"]
+
+
+def estimate_buy_xlm_amount(usdc_amount: Decimal, ask: Decimal, safety_fee_pct: Decimal) -> Decimal:
+    """
+    If ask = USDC per XLM, then expected XLM = USDC / ask
+    Apply a safety haircut based on FEE_PCT.
+    """
+    if ask <= 0:
+        return D("0")
+    expected = usdc_amount / ask
+    haircut = D("1") - (safety_fee_pct / D("100"))
+    return (expected * haircut).quantize(D("0.0000001"))  # 7 decimals
+
+
+def estimate_sell_usdc_min(xlm_amount: Decimal, bid: Decimal, safety_fee_pct: Decimal) -> Decimal:
+    """
+    If bid = USDC per XLM, expected USDC = XLM * bid
+    Apply safety haircut.
+    """
+    expected = xlm_amount * bid
+    haircut = D("1") - (safety_fee_pct / D("100"))
+    return (expected * haircut).quantize(D("0.0000001"))
+
 
 # -----------------------------
-# Main loop
+# MAIN LOOP
 # -----------------------------
-
-def validate_config():
-    # USDC requires issuer
-    if QUOTE_CODE.upper() != "XLM" and not QUOTE_ISSUER:
-        raise ValueError("QUOTE_ISSUER is required for non-native QUOTE asset (e.g., USDC).")
-    # If BASE is not XLM, issuer required too
-    if BASE_CODE.upper() != "XLM" and not BASE_ISSUER:
-        raise ValueError("BASE_ISSUER is required for non-native BASE asset.")
-
-    if MIN_TRIGGER_PCT <= 0 or MAX_TRIGGER_PCT <= 0:
-        raise ValueError("Trigger % must be > 0")
-    if MIN_TRIGGER_PCT > MAX_TRIGGER_PCT:
-        raise ValueError("MIN_TRIGGER_PCT must be <= MAX_TRIGGER_PCT")
-
-
 def main():
-    validate_config()
-
     print("Starting Container")
     print(f"Horizon: {HORIZON_URL}")
-    print(f"Pair: {pair_label()}")
+    print(f"Pair: {BASE_CODE}/{QUOTE_CODE}")
     print(f"Trigger range: {MIN_TRIGGER_PCT:.2f}% .. {MAX_TRIGGER_PCT:.2f}%")
-    print("Mode:", "LIVE" if TRADING_ENABLED else "PAPER", "(no offers are placed)" if not TRADING_ENABLED else "")
+    print(f"Mode: {'LIVE' if TRADING_ENABLED else 'PAPER'}")
     print(
-        f"Paper config: TRADE_USDC={TRADE_USDC}, INSIDE_PCT={INSIDE_PCT*100:.3f}%, "
-        f"HOLD_SECONDS={HOLD_SECONDS}, SELL_DELAY_SECONDS={SELL_DELAY_SECONDS}, "
-        f"SELL_TIMEOUT_SECONDS={SELL_TIMEOUT_SECONDS}, FEE_PCT={FEE_PCT*100:.2f}%"
+        f"Config: TRADE_USDC={TRADE_USDC}, HOLD_SECONDS={HOLD_SECONDS}, "
+        f"POLL_SEC={POLL_SEC}, FEE_PCT={FEE_PCT}%"
     )
     print("")
 
-    # Not required, but useful to ensure trades endpoint is configured correctly
-    cursor = fetch_latest_trade_token()
-    if cursor is None:
-        print("Note: Could not fetch latest trade cursor (Horizon might be rate-limiting). Continuing...\n")
-    else:
-        print(f"Latest trade cursor: {cursor}\n")
+    server = None
+    source_secret = None
+    source_public = None
+    if TRADING_ENABLED:
+        source_secret, source_public = load_trading_keys()
+        server = Server(HORIZON_URL)
+        print(f"LIVE wallet: {source_public}")
+        print("")
 
-    stats = PaperStats()
     last_summary = time.time()
+    opportunities = 0
 
     while True:
         try:
             ob = fetch_order_book()
-            bids = ob.get("bids", [])
-            asks = ob.get("asks", [])
-
-            if not bids or not asks:
+            bid, ask = best_bid_ask(ob)
+            if bid is None or ask is None:
                 print("Empty order book (no bids/asks).")
                 time.sleep(POLL_SEC)
                 continue
 
-            best_bid = D(bids[0]["price"])
-            best_ask = D(asks[0]["price"])
-            sp = spread_pct(best_bid, best_ask)
-
-            print(f"bid={best_bid:.7f} ask={best_ask:.7f} spread={sp:.4f}%")
+            sp = spread_pct(bid, ask)
+            print(f"bid={bid} ask={ask} spread={sp:.4f}%")
 
             if in_trigger_range(sp):
-                print(
-                    f"OPPORTUNITY: spread {sp:.4f}% within "
-                    f"{MIN_TRIGGER_PCT:.2f}%..{MAX_TRIGGER_PCT:.2f}%"
-                )
+                opportunities += 1
+                print(f"OPPORTUNITY: spread {sp:.4f}% is within {MIN_TRIGGER_PCT}%..{MAX_TRIGGER_PCT}%")
 
-                if TRADING_ENABLED:
-                    # Live trading is not implemented in this file (by design safety).
-                    # When you’re ready, we can add real offer management + signing.
-                    print("[LIVE] TRADING_ENABLED=true but live trading is not implemented yet in this version.")
+                if not TRADING_ENABLED:
+                    print("PAPER: would BUY XLM with USDC, wait, then SELL XLM back to USDC.\n")
                 else:
-                    paper_buy_sell(best_bid, best_ask, stats)
+                    # BUY: spend USDC, receive XLM (min based on ask)
+                    usdc_asset = sdk_asset(QUOTE_CODE, QUOTE_ISSUER)
+                    xlm_asset = sdk_asset(BASE_CODE, BASE_ISSUER)
 
-            # Periodic summary
+                    buy_min_xlm = estimate_buy_xlm_amount(TRADE_USDC, ask, FEE_PCT)
+                    if buy_min_xlm <= 0:
+                        print("LIVE: buy_min_xlm computed as 0; skipping.\n")
+                        time.sleep(POLL_SEC)
+                        continue
+
+                    print(f"LIVE: BUY spending {TRADE_USDC} {QUOTE_CODE} for at least {buy_min_xlm} {BASE_CODE}")
+                    buy_hash = submit_path_payment_strict_send(
+                        server=server,
+                        source_secret=source_secret,
+                        source_public=source_public,
+                        send_asset=usdc_asset,
+                        send_amount=TRADE_USDC,
+                        dest_asset=xlm_asset,
+                        dest_min=buy_min_xlm,
+                        memo_text="gap-buy",
+                    )
+                    print(f"LIVE: BUY tx hash: {buy_hash}")
+
+                    print(f"LIVE: waiting {HOLD_SECONDS}s before SELL ...")
+                    time.sleep(HOLD_SECONDS)
+
+                    # SELL: spend XLM, receive USDC (min based on bid)
+                    # We sell the amount we expected to get at minimum from the buy.
+                    sell_min_usdc = estimate_sell_usdc_min(buy_min_xlm, bid, FEE_PCT)
+                    if sell_min_usdc <= 0:
+                        print("LIVE: sell_min_usdc computed as 0; skipping sell.\n")
+                        time.sleep(POLL_SEC)
+                        continue
+
+                    print(f"LIVE: SELL spending {buy_min_xlm} {BASE_CODE} for at least {sell_min_usdc} {QUOTE_CODE}")
+                    sell_hash = submit_path_payment_strict_send(
+                        server=server,
+                        source_secret=source_secret,
+                        source_public=source_public,
+                        send_asset=xlm_asset,
+                        send_amount=buy_min_xlm,
+                        dest_asset=usdc_asset,
+                        dest_min=sell_min_usdc,
+                        memo_text="gap-sell",
+                    )
+                    print(f"LIVE: SELL tx hash: {sell_hash}\n")
+
+            # periodic summary
             now = time.time()
             if now - last_summary >= SUMMARY_SEC:
-                print(stats.summary_line())
+                print(f"\nSummary: opportunities seen in last {SUMMARY_SEC}s: {opportunities}\n")
+                opportunities = 0
                 last_summary = now
 
+            time.sleep(POLL_SEC)
+
         except requests.HTTPError as e:
-            # Print Horizon error body for debugging, but do not crash
+            # Horizon returned a non-2xx
             try:
-                resp = e.response.json()
-                print("Horizon error response:", resp)
+                detail = e.response.json()
+                print(f"Horizon HTTPError: {detail}")
             except Exception:
-                pass
-            print(f"HTTP error: {e}")
+                print(f"Horizon HTTPError: {e}")
+            time.sleep(POLL_SEC)
+
+        except (BadRequestError, NotFoundError) as e:
+            print(f"Stellar SDK error: {e}")
             time.sleep(POLL_SEC)
 
         except Exception as e:
