@@ -1,244 +1,307 @@
 import os
 import time
+import math
 import requests
 from decimal import Decimal, getcontext
-from datetime import datetime
 
 getcontext().prec = 28
-D = Decimal
+
+# -----------------------------
+# Env helpers
+# -----------------------------
+
+def env_str(name: str, default: str = "") -> str:
+    v = os.getenv(name, default)
+    return v.strip() if isinstance(v, str) else str(v)
+
+def env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return float(default)
+    return float(v)
+
+def env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "y", "on")
+
+def D(x) -> Decimal:
+    return Decimal(str(x))
+
+# -----------------------------
+# Config (variables)
+# -----------------------------
+
+HORIZON_URL = env_str("HORIZON_URL", "https://horizon.stellar.org")
+
+# Pair
+BASE_CODE = env_str("BASE_CODE", "XLM")      # native
+BASE_ISSUER = env_str("BASE_ISSUER", "")     # empty for native
+
+QUOTE_CODE = env_str("QUOTE_CODE", "USDC")
+QUOTE_ISSUER = env_str("QUOTE_ISSUER", "")   # required for USDC on Stellar
+
+# Trigger range in percent (e.g. 0.08 means 0.08%)
+MIN_TRIGGER_PCT = env_float("MIN_TRIGGER_PCT", 0.08)
+MAX_TRIGGER_PCT = env_float("MAX_TRIGGER_PCT", 0.13)
+
+# Loop cadence
+POLL_SEC = env_float("POLL_SEC", 1.0)
+SUMMARY_SEC = env_float("SUMMARY_SEC", 300.0)
+
+# Paper-trade sizing & behavior
+TRADE_USDC = env_float("TRADE_USDC", 10.0)  # how much USDC per "trade"
+HOLD_SECONDS = env_float("HOLD_SECONDS", 8.0)
+SELL_DELAY_SECONDS = env_float("SELL_DELAY_SECONDS", 3.0)
+SELL_TIMEOUT_SECONDS = env_float("SELL_TIMEOUT_SECONDS", 8.0)
+
+# Pricing & cost model
+INSIDE_PCT = env_float("INSIDE_PCT", 0.002)  # 0.2% (0.002) recommended
+FEE_PCT = env_float("FEE_PCT", 0.02)         # 2% conservative buffer
+
+# Safety: live trading disabled by default
+TRADING_ENABLED = env_bool("TRADING_ENABLED", False)
 
 
-# ----------------------------
-# ENV (Railway Variables)
-# ----------------------------
-HORIZON_URL = os.getenv("HORIZON_URL", "https://horizon.stellar.org").rstrip("/")
+# -----------------------------
+# Stellar/Horizon asset params
+# Horizon uses:
+#   native: asset_type=native
+#   credit: asset_type=credit_alphanum4 / credit_alphanum12 + asset_code + asset_issuer
+# For order_book/trades endpoints:
+#   selling_asset_* and buying_asset_* (or base/counter on some SDKs)
+# We'll use the canonical Horizon parameter names:
+#   selling_asset_type, selling_asset_code, selling_asset_issuer
+#   buying_asset_type, buying_asset_code, buying_asset_issuer
+# -----------------------------
 
-BASE_CODE = os.getenv("BASE_CODE", "XLM")
-BASE_ISSUER = os.getenv("BASE_ISSUER", "")  # empty for native XLM
+def asset_type_from_code(code: str) -> str:
+    # XLM is native
+    if code.upper() == "XLM":
+        return "native"
+    # Horizon needs alphanum4 or alphanum12
+    L = len(code)
+    if 1 <= L <= 4:
+        return "credit_alphanum4"
+    if 5 <= L <= 12:
+        return "credit_alphanum12"
+    raise ValueError(f"Invalid asset code length for {code!r}")
 
-QUOTE_CODE = os.getenv("QUOTE_CODE", "USDC")
-QUOTE_ISSUER = os.getenv("QUOTE_ISSUER", "")  # required for USDC
-
-MIN_TRIGGER_PCT = D(os.getenv("MIN_TRIGGER_PCT", "0.08"))  # percent
-MAX_TRIGGER_PCT = D(os.getenv("MAX_TRIGGER_PCT", "0.13"))  # percent
-
-POLL_SEC = float(os.getenv("POLL_SEC", "1.0"))
-
-# Paper trading config
-TRADE_USDC = D(os.getenv("TRADE_USDC", "10"))          # paper size in USDC
-HOLD_SECONDS = int(os.getenv("HOLD_SECONDS", "8"))     # max time to wait for buy fill
-SELL_DELAY_SECONDS = int(os.getenv("SELL_DELAY_SECONDS", "3"))  # after buy fill, wait then try sell
-SELL_TIMEOUT_SECONDS = int(os.getenv("SELL_TIMEOUT_SECONDS", "8"))
-
-# How far inside the spread to quote (percent)
-# 0.01 means 0.01% inside
-INSIDE_PCT = D(os.getenv("INSIDE_PCT", "0.01"))        # percent
-
-# Estimated total fee/slippage buffer (percent of notional)
-# Stellar base fees are tiny, but adverse selection/slippage isn't.
-FEE_PCT = D(os.getenv("FEE_PCT", "0.02"))              # percent
-
-SUMMARY_SEC = int(os.getenv("SUMMARY_SEC", "300"))     # stats print interval
-
-
-# ----------------------------
-# Helpers: assets + requests
-# ----------------------------
-def is_native(code: str, issuer: str) -> bool:
-    return code.upper() == "XLM" and (issuer or "") == ""
-
-
-def orderbook_params_for_asset(prefix: str, code: str, issuer: str) -> dict:
+def add_asset_params(params: dict, prefix: str, code: str, issuer: str):
     """
-    /order_book expects:
-      selling_asset_type, selling_asset_code, selling_asset_issuer
-      buying_asset_type,  buying_asset_code,  buying_asset_issuer
+    prefix is either 'selling' or 'buying'
     """
-    if is_native(code, issuer):
-        return {f"{prefix}_asset_type": "native"}
-    else:
-        # USDC is credit_alphanum4
-        asset_type = "credit_alphanum4" if len(code) <= 4 else "credit_alphanum12"
-        return {
-            f"{prefix}_asset_type": asset_type,
-            f"{prefix}_asset_code": code,
-            f"{prefix}_asset_issuer": issuer,
-        }
+    code = (code or "").strip()
+    issuer = (issuer or "").strip()
 
+    at = asset_type_from_code(code)
+    params[f"{prefix}_asset_type"] = at
 
-def trades_params_for_pair(base_code: str, base_issuer: str, counter_code: str, counter_issuer: str) -> dict:
-    """
-    /trades uses base_asset_* and counter_asset_* (this endpoint still uses base/counter naming).
-    """
+    if at != "native":
+        if not code:
+            raise ValueError(f"{prefix}: code is required for non-native asset")
+        if not issuer:
+            raise ValueError(f"{prefix}: issuer is required for non-native asset")
+        params[f"{prefix}_asset_code"] = code
+        params[f"{prefix}_asset_issuer"] = issuer
+
+def pair_label() -> str:
+    return f"{BASE_CODE.upper()}/{QUOTE_CODE.upper()}"
+
+# We interpret "BASE/QUOTE" as:
+# - selling = BASE (XLM)
+# - buying  = QUOTE (USDC)
+# This matches the idea: use order_book to view XLM/USDC price.
+def build_orderbook_params() -> dict:
     params = {}
+    add_asset_params(params, "selling", BASE_CODE, BASE_ISSUER)
+    add_asset_params(params, "buying", QUOTE_CODE, QUOTE_ISSUER)
+    return params
 
-    # base
-    if is_native(base_code, base_issuer):
-        params["base_asset_type"] = "native"
-    else:
-        params["base_asset_type"] = "credit_alphanum4" if len(base_code) <= 4 else "credit_alphanum12"
-        params["base_asset_code"] = base_code
-        params["base_asset_issuer"] = base_issuer
-
-    # counter
-    if is_native(counter_code, counter_issuer):
-        params["counter_asset_type"] = "native"
-    else:
-        params["counter_asset_type"] = "credit_alphanum4" if len(counter_code) <= 4 else "credit_alphanum12"
-        params["counter_asset_code"] = counter_code
-        params["counter_asset_issuer"] = counter_issuer
-
+def build_trades_params(order="desc", limit=1) -> dict:
+    params = {}
+    add_asset_params(params, "selling", BASE_CODE, BASE_ISSUER)
+    add_asset_params(params, "buying", QUOTE_CODE, QUOTE_ISSUER)
+    params["order"] = order
+    params["limit"] = int(limit)
     return params
 
 
-def fetch_order_book() -> dict:
-    # We want a book that effectively returns USDC-per-XLM prices like you were seeing.
-    # Use: selling = BASE (XLM), buying = QUOTE (USDC)
-    params = {}
-    params.update(orderbook_params_for_asset("selling", BASE_CODE, BASE_ISSUER))
-    params.update(orderbook_params_for_asset("buying", QUOTE_CODE, QUOTE_ISSUER))
+# -----------------------------
+# Horizon fetchers
+# -----------------------------
 
-    url = f"{HORIZON_URL}/order_book"
-    r = requests.get(url, params=params, timeout=15)
+def fetch_order_book() -> dict:
+    """
+    Horizon /order_book gives:
+      bids: [{price, amount, ...}]
+      asks: [{price, amount, ...}]
+    price here is "price of selling asset in terms of buying asset"
+    For selling=XLM, buying=USDC => price is USDC per XLM
+    """
+    url = f"{HORIZON_URL.rstrip('/')}/order_book"
+    params = build_orderbook_params()
+    r = requests.get(url, params=params, timeout=10)
     r.raise_for_status()
     return r.json()
 
-
 def fetch_latest_trade_token() -> str | None:
     """
-    Get the most recent trade paging token so we can stream forward from "now".
+    Gets the latest trade and returns paging_token (cursor).
+    Using requests params prevents malformed URLs (your crash).
     """
-    url = f"{HORIZON_URL}/trades"
-    params = trades_params_for_pair(BASE_CODE, BASE_ISSUER, QUOTE_CODE, QUOTE_ISSUER)
-    params.update({"order": "desc", "limit": 1})
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    records = r.json().get("_embedded", {}).get("records", [])
-    if not records:
+    url = f"{HORIZON_URL.rstrip('/')}/trades"
+    params = build_trades_params(order="desc", limit=1)
+
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        recs = data.get("_embedded", {}).get("records", [])
+        if not recs:
+            return None
+        return recs[0].get("paging_token")
+    except requests.RequestException as e:
+        print(f"Error fetching latest trade token: {e}")
         return None
-    return records[0].get("paging_token")
 
 
-def fetch_trades_since(cursor: str | None, limit: int = 200) -> tuple[list[dict], str | None]:
-    """
-    Fetch trades after 'cursor' (ascending). Returns (records, last_token).
-    """
-    url = f"{HORIZON_URL}/trades"
-    params = trades_params_for_pair(BASE_CODE, BASE_ISSUER, QUOTE_CODE, QUOTE_ISSUER)
-    params.update({"order": "asc", "limit": limit})
-    if cursor:
-        params["cursor"] = cursor
-
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-
-    records = r.json().get("_embedded", {}).get("records", [])
-    last_token = records[-1]["paging_token"] if records else cursor
-    return records, last_token
-
+# -----------------------------
+# Math helpers
+# -----------------------------
 
 def spread_pct(best_bid: Decimal, best_ask: Decimal) -> Decimal:
-    if best_bid <= 0:
-        return D("0")
-    return ((best_ask - best_bid) / best_bid) * D("100")
+    if best_ask <= 0:
+        return D(0)
+    return (best_ask - best_bid) / best_ask * D(100)
+
+def in_trigger_range(sp_pct: Decimal) -> bool:
+    return D(MIN_TRIGGER_PCT) <= sp_pct <= D(MAX_TRIGGER_PCT)
+
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
 
 
-def in_trigger(sp: Decimal) -> bool:
-    return MIN_TRIGGER_PCT <= sp <= MAX_TRIGGER_PCT
+# -----------------------------
+# PAPER trading simulation
+# -----------------------------
 
-
-def inside_price(price: Decimal, pct: Decimal, direction: str) -> Decimal:
-    """
-    direction:
-      'up'   -> price * (1 + pct/100)
-      'down' -> price * (1 - pct/100)
-    """
-    p = pct / D("100")
-    if direction == "up":
-        return price * (D("1") + p)
-    return price * (D("1") - p)
-
-
-def safe_dec(x) -> Decimal:
-    return D(str(x))
-
-
-# ----------------------------
-# Paper simulation
-# ----------------------------
-class Stats:
+class PaperStats:
     def __init__(self):
-        self.opportunities = 0
-        self.buy_attempts = 0
-        self.buy_fills = 0
-        self.sell_attempts = 0
-        self.sell_fills = 0
-        self.pnl_usdc = D("0")
-        self.last_summary = time.time()
+        self.trades = 0
+        self.wins = 0
+        self.losses = 0
+        self.pnl_usdc = D(0)
+        self.gross_usdc = D(0)
+        self.fees_usdc = D(0)
 
-    def summary(self):
+    def record(self, pnl: Decimal, gross: Decimal, fees: Decimal):
+        self.trades += 1
+        self.pnl_usdc += pnl
+        self.gross_usdc += gross
+        self.fees_usdc += fees
+        if pnl >= 0:
+            self.wins += 1
+        else:
+            self.losses += 1
+
+    def summary_line(self) -> str:
+        avg = (self.pnl_usdc / D(self.trades)) if self.trades else D(0)
         return (
-            f"\n--- PAPER STATS ---\n"
-            f"opportunities: {self.opportunities}\n"
-            f"buy attempts:  {self.buy_attempts}\n"
-            f"buy fills:     {self.buy_fills}\n"
-            f"sell attempts: {self.sell_attempts}\n"
-            f"sell fills:    {self.sell_fills}\n"
-            f"est PnL USDC:  {self.pnl_usdc:.6f}\n"
-            f"--------------\n"
+            f"[SUMMARY] trades={self.trades} wins={self.wins} losses={self.losses} "
+            f"pnl={self.pnl_usdc:.6f} USDC (avg {avg:.6f}) "
+            f"gross={self.gross_usdc:.6f} fees={self.fees_usdc:.6f}"
         )
 
 
-def trade_price_usdc_per_xlm(tr: dict) -> Decimal | None:
+def paper_buy_sell(best_bid: Decimal, best_ask: Decimal, stats: PaperStats):
     """
-    Horizon trade record includes 'base_is_seller' and 'price' object.
-    We avoid overthinking: many Horizon trade records include a 'price' object with 'n'/'d',
-    and also 'base_amount'/'counter_amount'. We'll compute counter/base as USDC per XLM.
+    Option A (your request):
+      if spread triggers -> BUY then SELL after a few seconds
+    In paper-mode we simulate:
+      buy_price  ~ best_ask adjusted inside
+      sell_price ~ best_bid adjusted inside
     """
-    try:
-        base_amt = safe_dec(tr.get("base_amount"))
-        counter_amt = safe_dec(tr.get("counter_amount"))
-        if base_amt == 0:
-            return None
-        return counter_amt / base_amt
-    except Exception:
-        return None
+    inside = D(INSIDE_PCT) * D(100)  # convert 0.002 -> 0.2% (as percent)
+    fee_pct = D(FEE_PCT)
+
+    # Buy slightly better than ask (inside)
+    buy_price = best_ask * (D(1) - D(INSIDE_PCT))
+    # Sell slightly better than bid (inside)
+    sell_price = best_bid * (D(1) + D(INSIDE_PCT))
+
+    # Use TRADE_USDC as quote size
+    quote_in = D(TRADE_USDC)
+    if buy_price <= 0:
+        return
+
+    base_bought = quote_in / buy_price  # XLM amount in paper
+
+    # Wait / hold (simulate time exposure)
+    time.sleep(float(HOLD_SECONDS))
+    time.sleep(float(SELL_DELAY_SECONDS))
+
+    # Simulate sell proceeds
+    quote_out = base_bought * sell_price
+
+    # Conservative fee model: apply fee_pct to both legs
+    fees = (quote_in * fee_pct) + (quote_out * fee_pct)
+    gross = quote_out - quote_in
+    pnl = gross - fees
+
+    stats.record(pnl=pnl, gross=gross, fees=fees)
+
+    print(
+        f"[PAPER TRADE] buy@{buy_price:.7f} sell@{sell_price:.7f} "
+        f"in={quote_in:.4f} out={quote_out:.4f} gross={gross:.6f} "
+        f"fees={fees:.6f} pnl={pnl:.6f}"
+    )
 
 
-def would_fill_buy(trades: list[dict], buy_price: Decimal) -> bool:
-    # We get filled buying XLM if trade prints at price <= our bid.
-    for tr in trades:
-        p = trade_price_usdc_per_xlm(tr)
-        if p is not None and p <= buy_price:
-            return True
-    return False
+# -----------------------------
+# Main loop
+# -----------------------------
 
+def validate_config():
+    # USDC requires issuer
+    if QUOTE_CODE.upper() != "XLM" and not QUOTE_ISSUER:
+        raise ValueError("QUOTE_ISSUER is required for non-native QUOTE asset (e.g., USDC).")
+    # If BASE is not XLM, issuer required too
+    if BASE_CODE.upper() != "XLM" and not BASE_ISSUER:
+        raise ValueError("BASE_ISSUER is required for non-native BASE asset.")
 
-def would_fill_sell(trades: list[dict], sell_price: Decimal) -> bool:
-    # We get filled selling XLM if trade prints at price >= our ask.
-    for tr in trades:
-        p = trade_price_usdc_per_xlm(tr)
-        if p is not None and p >= sell_price:
-            return True
-    return False
+    if MIN_TRIGGER_PCT <= 0 or MAX_TRIGGER_PCT <= 0:
+        raise ValueError("Trigger % must be > 0")
+    if MIN_TRIGGER_PCT > MAX_TRIGGER_PCT:
+        raise ValueError("MIN_TRIGGER_PCT must be <= MAX_TRIGGER_PCT")
 
 
 def main():
-    print("Starting Container", flush=True)
+    validate_config()
+
+    print("Starting Container")
     print(f"Horizon: {HORIZON_URL}")
-    print(f"Pair: {BASE_CODE}/{QUOTE_CODE}")
+    print(f"Pair: {pair_label()}")
     print(f"Trigger range: {MIN_TRIGGER_PCT:.2f}% .. {MAX_TRIGGER_PCT:.2f}%")
-    print("Mode: PAPER (no offers are placed)")
+    print("Mode:", "LIVE" if TRADING_ENABLED else "PAPER", "(no offers are placed)" if not TRADING_ENABLED else "")
     print(
-        f"Paper config: TRADE_USDC={TRADE_USDC}, INSIDE_PCT={INSIDE_PCT}%, "
-        f"HOLD_SECONDS={HOLD_SECONDS}, SELL_DELAY_SECONDS={SELL_DELAY_SECONDS}, SELL_TIMEOUT_SECONDS={SELL_TIMEOUT_SECONDS}, "
-        f"FEE_PCT={FEE_PCT}%\n"
+        f"Paper config: TRADE_USDC={TRADE_USDC}, INSIDE_PCT={INSIDE_PCT*100:.3f}%, "
+        f"HOLD_SECONDS={HOLD_SECONDS}, SELL_DELAY_SECONDS={SELL_DELAY_SECONDS}, "
+        f"SELL_TIMEOUT_SECONDS={SELL_TIMEOUT_SECONDS}, FEE_PCT={FEE_PCT*100:.2f}%"
     )
+    print("")
 
-    stats = Stats()
+    # Not required, but useful to ensure trades endpoint is configured correctly
+    cursor = fetch_latest_trade_token()
+    if cursor is None:
+        print("Note: Could not fetch latest trade cursor (Horizon might be rate-limiting). Continuing...\n")
+    else:
+        print(f"Latest trade cursor: {cursor}\n")
 
-    # Start trade cursor at "now" so we only watch future trades
-    trade_cursor = fetch_latest_trade_token()
+    stats = PaperStats()
+    last_summary = time.time()
 
     while True:
         try:
@@ -251,112 +314,39 @@ def main():
                 time.sleep(POLL_SEC)
                 continue
 
-            best_bid = safe_dec(bids[0]["price"])
-            best_ask = safe_dec(asks[0]["price"])
+            best_bid = D(bids[0]["price"])
+            best_ask = D(asks[0]["price"])
             sp = spread_pct(best_bid, best_ask)
 
-            print(f"bid={best_bid} ask={best_ask} spread={sp:.4f}%")
+            print(f"bid={best_bid:.7f} ask={best_ask:.7f} spread={sp:.4f}%")
 
-            # print periodic stats
+            if in_trigger_range(sp):
+                print(
+                    f"OPPORTUNITY: spread {sp:.4f}% within "
+                    f"{MIN_TRIGGER_PCT:.2f}%..{MAX_TRIGGER_PCT:.2f}%"
+                )
+
+                if TRADING_ENABLED:
+                    # Live trading is not implemented in this file (by design safety).
+                    # When you’re ready, we can add real offer management + signing.
+                    print("[LIVE] TRADING_ENABLED=true but live trading is not implemented yet in this version.")
+                else:
+                    paper_buy_sell(best_bid, best_ask, stats)
+
+            # Periodic summary
             now = time.time()
-            if now - stats.last_summary >= SUMMARY_SEC:
-                print(stats.summary())
-                stats.last_summary = now
-
-            if not in_trigger(sp):
-                time.sleep(POLL_SEC)
-                continue
-
-            stats.opportunities += 1
-
-            # Paper BUY: slightly above best bid (inside spread)
-            buy_price = inside_price(best_bid, INSIDE_PCT, "up")
-            stats.buy_attempts += 1
-            print(f"🎯 TRIGGER: spread in range. PAPER BUY @ {buy_price} (inside +{INSIDE_PCT}%)")
-
-            # Wait up to HOLD_SECONDS to see if trades print through us
-            buy_filled = False
-            t_end = time.time() + HOLD_SECONDS
-
-            while time.time() < t_end:
-                new_trades, trade_cursor = fetch_trades_since(trade_cursor, limit=200)
-                if new_trades and would_fill_buy(new_trades, buy_price):
-                    buy_filled = True
-                    break
-                time.sleep(1.0)
-
-            if not buy_filled:
-                print("⛔ PAPER BUY not filled within timeout. Cancel (paper).")
-                time.sleep(POLL_SEC)
-                continue
-
-            stats.buy_fills += 1
-            base_qty = (TRADE_USDC / buy_price)  # XLM amount acquired (paper)
-            print(f"✅ PAPER BUY filled. qty≈{base_qty:.7f} XLM  (spent {TRADE_USDC} USDC)")
-
-            # Wait a bit before selling
-            time.sleep(max(0, SELL_DELAY_SECONDS))
-
-            # Refresh orderbook for sell pricing
-            ob2 = fetch_order_book()
-            bids2 = ob2.get("bids", [])
-            asks2 = ob2.get("asks", [])
-            if not bids2 or not asks2:
-                print("Orderbook empty after buy; skipping sell (paper).")
-                time.sleep(POLL_SEC)
-                continue
-
-            best_bid2 = safe_dec(bids2[0]["price"])
-            best_ask2 = safe_dec(asks2[0]["price"])
-
-            # Paper SELL: slightly below best ask (inside spread)
-            sell_price = inside_price(best_ask2, INSIDE_PCT, "down")
-            stats.sell_attempts += 1
-            print(f"📌 PAPER SELL @ {sell_price} (inside -{INSIDE_PCT}%)")
-
-            sell_filled = False
-            t_end2 = time.time() + SELL_TIMEOUT_SECONDS
-
-            while time.time() < t_end2:
-                new_trades, trade_cursor = fetch_trades_since(trade_cursor, limit=200)
-                if new_trades and would_fill_sell(new_trades, sell_price):
-                    sell_filled = True
-                    break
-                time.sleep(1.0)
-
-            if not sell_filled:
-                print("⛔ PAPER SELL not filled within timeout. Cancel (paper).")
-                time.sleep(POLL_SEC)
-                continue
-
-            stats.sell_fills += 1
-
-            gross_proceeds = base_qty * sell_price  # USDC
-            gross_pnl = gross_proceeds - TRADE_USDC
-
-            # Apply a conservative fee/slippage buffer on notional (round-trip)
-            # Buffer is applied to the full notional twice (buy+sell) roughly, so 2x.
-            buffer = (TRADE_USDC * (FEE_PCT / D("100"))) * D("2")
-            net_pnl = gross_pnl - buffer
-
-            stats.pnl_usdc += net_pnl
-
-            print(
-                f"✅ PAPER SELL filled.\n"
-                f"   gross proceeds: {gross_proceeds:.6f} USDC\n"
-                f"   gross PnL:      {gross_pnl:.6f} USDC\n"
-                f"   buffer (fees):  {buffer:.6f} USDC\n"
-                f"   NET PnL:        {net_pnl:.6f} USDC\n"
-            )
-
-            time.sleep(POLL_SEC)
+            if now - last_summary >= SUMMARY_SEC:
+                print(stats.summary_line())
+                last_summary = now
 
         except requests.HTTPError as e:
-            # Print Horizon error body if available
+            # Print Horizon error body for debugging, but do not crash
             try:
-                print(f"HTTPError: {e} | response: {e.response.text[:600]}")
+                resp = e.response.json()
+                print("Horizon error response:", resp)
             except Exception:
-                print(f"HTTPError: {e}")
+                pass
+            print(f"HTTP error: {e}")
             time.sleep(POLL_SEC)
 
         except Exception as e:
