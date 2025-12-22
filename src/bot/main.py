@@ -60,7 +60,7 @@ def main():
 
     while True:
         try:
-            ob = server.order_book(base=base, quote=quote).call()
+            ob = server.orderbook(base=base, quote=quote).call()
             bids = ob.get("bids", [])
             asks = ob.get("asks", [])
 
