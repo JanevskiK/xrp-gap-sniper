@@ -1,14 +1,4 @@
 #!/usr/bin/env python3
-"""
-Paper-trading bot for Stellar orderbook spreads (e.g., XLM/USDC).
-- NO real trades are submitted.
-- NO Stellar secret seed is required.
-- Reads best bid/ask from Horizon orderbook (public GET endpoint).
-- Simulates: if spread >= threshold, buy at ask then sell at bid after HOLD_SECONDS.
-- Persists balances + trades to STATS_FILE (JSON).
-- Reports rolling profit over ROLLING_HOURS (default 48).
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -21,394 +11,389 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 
 
-# -----------------------------
-# Config
-# -----------------------------
+# =========================
+# Helpers: env parsing
+# =========================
+
+def _env(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return default if v is None else v
 
 def env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None or v == "":
-        return default
-    return float(v)
+    v = _env(name, "")
+    return default if v.strip() == "" else float(v)
 
 def env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None or v == "":
+    v = _env(name, "")
+    return default if v.strip() == "" else int(float(v))
+
+def env_bool(name: str, default: bool = False) -> bool:
+    v = _env(name, "")
+    if v.strip() == "":
         return default
-    return int(v)
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
-def env_str(name: str, default: str) -> str:
-    v = os.getenv(name)
-    return default if v is None or v == "" else v
 
-HORIZON_URL = env_str("HORIZON_URL", "https://horizon.stellar.org")
+# =========================
+# Config (matches your vars)
+# =========================
 
-# Assets for the orderbook:
-# base = what you're pricing (XLM by default)
-# counter = what you pay/receive (USDC by default)
-BASE_CODE = env_str("BASE_CODE", "XLM")
-BASE_ISSUER = env_str("BASE_ISSUER", "")  # empty means native XLM
+HORIZON_URL = _env("HORIZON_URL", "https://horizon.stellar.org").strip().strip('"')
 
-COUNTER_CODE = env_str("COUNTER_CODE", "USDC")
-COUNTER_ISSUER = env_str("COUNTER_ISSUER", "")  # REQUIRED for non-native assets (like USDC)
+BASE_ASSET_TYPE = _env("BASE_ASSET_TYPE", "native").strip().strip('"')  # "native" only in your config
+BASE_ASSET_CODE = _env("BASE_ASSET_CODE", "").strip().strip('"')
+BASE_ASSET_ISSUER = _env("BASE_ASSET_ISSUER", "").strip().strip('"')
 
-# Trading behavior
+COUNTER_ASSET_TYPE = _env("COUNTER_ASSET_TYPE", "credit_alphanum4").strip().strip('"')
+COUNTER_ASSET_CODE = _env("COUNTER_ASSET_CODE", "USDC").strip().strip('"')
+COUNTER_ASSET_ISSUER = _env("COUNTER_ASSET_ISSUER", "").strip().strip('"')
+
+POLL_SECONDS = env_float("POLL_SECONDS", 1.0)
+TRADE_COUNTER_AMOUNT = env_float("TRADE_COUNTER_AMOUNT", 100.0)
+
+MIN_SPREAD_PCT = env_float("MIN_SPREAD_PCT", 0.03)      # percent
+MIN_DEPTH_MULT = env_float("MIN_DEPTH_MULT", 0.02)      # fraction of TRADE_COUNTER_AMOUNT needed at top of book
+
+PRINT_EVERY = env_int("PRINT_EVERY", 1)
 REPORT_EVERY_SECONDS = env_int("REPORT_EVERY_SECONDS", 60)
-HOLD_SECONDS = env_int("HOLD_SECONDS", 5)  # how long to wait between buy & sell simulation
-SPREAD_TRIGGER_PCT = env_float("SPREAD_TRIGGER_PCT", 0.05)  # e.g. 0.05 = 0.05%
-TRADE_USDC = env_float("TRADE_USDC", 10.0)  # how much counter asset to spend per simulated buy (in USDC)
-NETWORK_FEE_XLM = env_float("NETWORK_FEE_XLM", 0.00001)  # simulated fee per operation (optional)
-OPS_PER_FILL = env_int("OPS_PER_FILL", 2)  # buy + sell
-
-# Inventory / risk controls (paper only)
-MIN_INVENTORY_XLM = env_float("MIN_INVENTORY_XLM", 0.0)
-MAX_INVENTORY_XLM = env_float("MAX_INVENTORY_XLM", 2000.0)
-
-# Stats persistence
-STATS_FILE = env_str("STATS_FILE", "/tmp/stellar_mm_trades.jsonl")  # jsonl-ish; we store one JSON object file
 ROLLING_HOURS = env_int("ROLLING_HOURS", 48)
 
-# If you want deterministic starting balances, set these:
-START_USDC = env_float("START_USDC", 1000.0)
-START_XLM = env_float("START_XLM", 0.0)
+INITIAL_USDC = env_float("INITIAL_USDC", 1000.0)
+INITIAL_XLM = env_float("INITIAL_XLM", 0.0)
 
-# Safety: force paper mode always (no secrets needed)
-PAPER_TRADING = True
+REQUOTE_SECONDS = env_int("REQUOTE_SECONDS", 60)
+REQUOTE_BPS = env_int("REQUOTE_BPS", 10)  # used as informational here
+
+ORDER_TIMEOUT_SECONDS = env_int("ORDER_TIMEOUT_SECONDS", 900)
+QUEUE_JOIN_FACTOR = env_float("QUEUE_JOIN_FACTOR", 1.0)
+FILL_RATE_CAP = env_float("FILL_RATE_CAP", 999999.0)  # not limiting in this paper version
+
+NETWORK_FEE_XLM = env_float("NETWORK_FEE_XLM", 0.00001)
+OPS_PER_FILL = env_int("OPS_PER_FILL", 2)
+
+MAX_INVENTORY_XLM = env_float("MAX_INVENTORY_XLM", 2000.0)
+MIN_INVENTORY_XLM = env_float("MIN_INVENTORY_XLM", 0.0)
+
+TARGET_XLM = env_float("TARGET_XLM", 500.0)
+BAND_XLM = env_float("BAND_XLM", 150.0)
+
+STATS_FILE = _env("STATS_FILE", "/tmp/stellar_mm_trades.jsonl").strip().strip('"')
+
+PAPER_TRADING = env_bool("PAPER_TRADING", True)  # should be True for you
 
 
-# -----------------------------
-# Data structures
-# -----------------------------
+# =========================
+# Data models
+# =========================
 
 @dataclass
 class Trade:
     ts: float
-    side: str  # "BUY" or "SELL"
-    price: float  # counter per base (USDC per XLM)
-    base_amount: float
-    counter_amount: float  # USDC delta (negative for buy, positive for sell)
-    fee_xlm: float = 0.0
+    action: str               # "BUY" or "SELL"
+    price: float              # USDC per XLM
+    xlm: float
+    usdc: float               # signed delta: BUY negative, SELL positive
+    spread_pct: float
     note: str = ""
+    fee_xlm: float = 0.0
 
 @dataclass
 class State:
-    bal_usdc: float
-    bal_xlm: float
-    trades: List[Trade]
     started_ts: float
+    balUSDC: float
+    balXLM: float
+    trades: List[Trade]
+    last_requote_ts: float
 
-    def to_json(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         return {
-            "bal_usdc": self.bal_usdc,
-            "bal_xlm": self.bal_xlm,
             "started_ts": self.started_ts,
+            "balUSDC": self.balUSDC,
+            "balXLM": self.balXLM,
+            "last_requote_ts": self.last_requote_ts,
             "trades": [asdict(t) for t in self.trades],
         }
 
     @staticmethod
-    def from_json(d: Dict[str, Any]) -> "State":
+    def from_dict(d: Dict[str, Any]) -> "State":
         trades = [Trade(**t) for t in d.get("trades", [])]
         return State(
-            bal_usdc=float(d.get("bal_usdc", START_USDC)),
-            bal_xlm=float(d.get("bal_xlm", START_XLM)),
             started_ts=float(d.get("started_ts", time.time())),
+            balUSDC=float(d.get("balUSDC", INITIAL_USDC)),
+            balXLM=float(d.get("balXLM", INITIAL_XLM)),
+            last_requote_ts=float(d.get("last_requote_ts", 0.0)),
             trades=trades,
         )
 
 
-# -----------------------------
+# =========================
 # Persistence
-# -----------------------------
+# =========================
 
 def load_state() -> State:
     if not os.path.exists(STATS_FILE):
-        return State(bal_usdc=START_USDC, bal_xlm=START_XLM, trades=[], started_ts=time.time())
+        return State(time.time(), INITIAL_USDC, INITIAL_XLM, [], 0.0)
     try:
         with open(STATS_FILE, "r", encoding="utf-8") as f:
-            raw = f.read().strip()
-            if not raw:
-                return State(bal_usdc=START_USDC, bal_xlm=START_XLM, trades=[], started_ts=time.time())
-            d = json.loads(raw)
-            return State.from_json(d)
+            txt = f.read().strip()
+            if not txt:
+                return State(time.time(), INITIAL_USDC, INITIAL_XLM, [], 0.0)
+            return State.from_dict(json.loads(txt))
     except Exception:
-        # If file corrupted, start fresh but don't crash
-        return State(bal_usdc=START_USDC, bal_xlm=START_XLM, trades=[], started_ts=time.time())
+        # don't crash due to a bad file
+        return State(time.time(), INITIAL_USDC, INITIAL_XLM, [], 0.0)
 
 def save_state(state: State) -> None:
     os.makedirs(os.path.dirname(STATS_FILE), exist_ok=True)
     with open(STATS_FILE, "w", encoding="utf-8") as f:
-        json.dump(state.to_json(), f, ensure_ascii=False, indent=2)
+        json.dump(state.to_dict(), f, ensure_ascii=False, indent=2)
 
 
-# -----------------------------
-# Horizon orderbook fetch
-# -----------------------------
+# =========================
+# Horizon orderbook
+# =========================
 
-def asset_query_params(prefix: str, code: str, issuer: str) -> Dict[str, str]:
-    """
-    Horizon expects:
-      - native asset: <prefix>_asset_type=native
-      - non-native: <prefix>_asset_type=credit_alphanum4|credit_alphanum12 + code + issuer
-    """
-    if issuer == "" and code.upper() == "XLM":
+def _asset_params(prefix: str, asset_type: str, code: str, issuer: str) -> Dict[str, str]:
+    if asset_type == "native":
         return {f"{prefix}_asset_type": "native"}
-
-    if issuer == "":
-        raise RuntimeError(
-            f"Missing {prefix.upper()} issuer for non-native asset {code}. "
-            f"Set {prefix.upper()}_ISSUER env var."
-        )
-
-    asset_type = "credit_alphanum4" if len(code) <= 4 else "credit_alphanum12"
+    if issuer.strip() == "" or code.strip() == "":
+        raise RuntimeError(f"Missing {prefix} asset code/issuer for non-native asset.")
+    # Horizon accepts credit_alphanum4 or credit_alphanum12
     return {
         f"{prefix}_asset_type": asset_type,
         f"{prefix}_asset_code": code,
         f"{prefix}_asset_issuer": issuer,
     }
 
-async def fetch_best_bid_ask(session: aiohttp.ClientSession) -> Tuple[float, float, float, float]:
-    """
-    Returns: (best_bid_price, best_ask_price, best_bid_amount_base, best_ask_amount_base)
-    Price is COUNTER per BASE.
-    """
-    params = {}
-    params.update(asset_query_params("selling", BASE_CODE, BASE_ISSUER))
-    params.update(asset_query_params("buying", COUNTER_CODE, COUNTER_ISSUER))
-
+async def fetch_orderbook(session: aiohttp.ClientSession) -> Dict[str, Any]:
     url = f"{HORIZON_URL.rstrip('/')}/order_book"
+    params: Dict[str, str] = {}
+    # selling = BASE, buying = COUNTER (this yields prices in COUNTER per BASE)
+    params.update(_asset_params("selling", BASE_ASSET_TYPE, BASE_ASSET_CODE, BASE_ASSET_ISSUER))
+    params.update(_asset_params("buying", COUNTER_ASSET_TYPE, COUNTER_ASSET_CODE, COUNTER_ASSET_ISSUER))
+
     async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
         r.raise_for_status()
-        data = await r.json()
+        return await r.json()
 
-    bids = data.get("bids", [])
-    asks = data.get("asks", [])
+def _best_levels(ob: Dict[str, Any]) -> Tuple[float, float, float, float]:
+    bids = ob.get("bids", [])
+    asks = ob.get("asks", [])
     if not bids or not asks:
         raise RuntimeError("Orderbook empty (no bids or asks).")
+    bid_price = float(bids[0]["price"])
+    bid_xlm = float(bids[0]["amount"])
+    ask_price = float(asks[0]["price"])
+    ask_xlm = float(asks[0]["amount"])
+    return bid_price, ask_price, bid_xlm, ask_xlm
 
-    best_bid = float(bids[0]["price"])         # counter/base
-    best_bid_amt = float(bids[0]["amount"])    # base amount available at bid
-    best_ask = float(asks[0]["price"])         # counter/base
-    best_ask_amt = float(asks[0]["amount"])    # base amount available at ask
-
-    return best_bid, best_ask, best_bid_amt, best_ask_amt
-
-
-# -----------------------------
-# Paper trading logic
-# -----------------------------
-
-def pct_spread(bid: float, ask: float) -> float:
-    if bid <= 0 or ask <= 0 or ask < bid:
+def spread_pct(bid: float, ask: float) -> float:
+    if bid <= 0 or ask <= 0:
         return 0.0
     mid = (bid + ask) / 2.0
+    if mid <= 0:
+        return 0.0
     return (ask - bid) / mid * 100.0
 
-def now_ts() -> float:
-    return time.time()
 
-def rolling_profit_usdc(state: State, hours: int) -> float:
-    """
-    Profit over last N hours based on net USDC change from SELL/BUY trade deltas.
-    We treat:
-      BUY  => counter_amount negative (spend USDC)
-      SELL => counter_amount positive (receive USDC)
-    Profit window = sum(counter_amount) over trades within window.
-    """
-    cutoff = now_ts() - hours * 3600
-    p = 0.0
+# =========================
+# Profit window
+# =========================
+
+def rolling_profit(state: State, hours: int) -> Tuple[float, int]:
+    cutoff = time.time() - hours * 3600
+    prof = 0.0
+    n = 0
     for t in state.trades:
         if t.ts >= cutoff:
-            p += float(t.counter_amount)
-    return p
+            prof += t.usdc
+            n += 1
+    return prof, n
 
-def prune_old_trades(state: State, keep_hours: int = 24 * 14) -> None:
-    """
-    Keep last ~2 weeks by default to avoid huge state files.
-    Rolling profit uses ROLLING_HOURS anyway.
-    """
-    cutoff = now_ts() - keep_hours * 3600
+def prune_old(state: State, keep_hours: int = 24 * 14) -> None:
+    cutoff = time.time() - keep_hours * 3600
     state.trades = [t for t in state.trades if t.ts >= cutoff]
 
-def can_buy(state: State, usdc_to_spend: float, expected_base: float) -> bool:
-    if state.bal_usdc < usdc_to_spend:
-        return False
-    # Ensure inventory won't exceed cap after buy
-    if state.bal_xlm + expected_base > MAX_INVENTORY_XLM:
-        return False
-    return True
 
-def can_sell(state: State, base_to_sell: float) -> bool:
-    if state.bal_xlm - base_to_sell < MIN_INVENTORY_XLM:
-        return False
-    return True
+# =========================
+# Paper execution model
+# =========================
 
-def apply_fee_xlm(state: State, fee_xlm: float) -> None:
-    # Fee taken from XLM balance for simulation. If you have no XLM, keep it 0.
+def within_band(state: State) -> bool:
+    # if inventory is far from target, you may want to bias behavior
+    return (TARGET_XLM - BAND_XLM) <= state.balXLM <= (TARGET_XLM + BAND_XLM)
+
+def apply_fee(state: State, fee_xlm: float) -> None:
     if fee_xlm <= 0:
         return
-    state.bal_xlm = max(0.0, state.bal_xlm - fee_xlm)
+    state.balXLM = max(0.0, state.balXLM - fee_xlm)
 
-def record_trade(state: State, trade: Trade) -> None:
-    state.trades.append(trade)
-
-async def simulate_cycle(
+async def try_trade_paper(
     state: State,
     bid: float,
     ask: float,
-    bid_amt: float,
-    ask_amt: float,
-    spread_pct: float,
+    bid_xlm: float,
+    ask_xlm: float,
+    spr: float,
 ) -> Optional[str]:
     """
-    If spread meets trigger, do paper buy and paper sell after HOLD_SECONDS.
-    Returns a short note about action taken (or None if no trade).
+    Simulate:
+      - if spread >= MIN_SPREAD_PCT and top-of-book depth sufficient:
+        BUY at ask using TRADE_COUNTER_AMOUNT USDC
+        wait a short moment based on QUEUE_JOIN_FACTOR and POLL_SECONDS
+        SELL at bid
     """
-    if spread_pct < SPREAD_TRIGGER_PCT:
-        return None
-
-    # Buy with TRADE_USDC at ASK
-    usdc_spend = min(TRADE_USDC, state.bal_usdc)
-    if usdc_spend <= 0:
-        return None
-
-    base_buy = usdc_spend / ask  # XLM amount bought
-    # Respect top-of-book available liquidity (paper approximation)
-    base_buy = min(base_buy, ask_amt)
-
-    if base_buy <= 0:
-        return None
-
-    if not can_buy(state, usdc_spend, base_buy):
-        return "skip (buy blocked by balance/cap)"
-
-    fee_total_xlm = NETWORK_FEE_XLM * OPS_PER_FILL
-
-    # Apply BUY
-    state.bal_usdc -= usdc_spend
-    state.bal_xlm += base_buy
-    apply_fee_xlm(state, fee_total_xlm / 2.0)
-
-    record_trade(
-        state,
-        Trade(
-            ts=now_ts(),
-            side="BUY",
-            price=ask,
-            base_amount=base_buy,
-            counter_amount=-usdc_spend,
-            fee_xlm=fee_total_xlm / 2.0,
-            note=f"spread={spread_pct:.4f}%",
-        ),
-    )
-
-    # Wait then SELL at BID
-    await asyncio.sleep(max(0, HOLD_SECONDS))
-
-    base_sell = base_buy
-    # Respect top-of-book bid liquidity too
-    base_sell = min(base_sell, bid_amt)
-
-    if base_sell <= 0:
-        return "bought but cannot sell (no bid liquidity)"
-
-    if not can_sell(state, base_sell):
-        return "bought but sell blocked (min inventory)"
-
-    usdc_receive = base_sell * bid
-
-    state.bal_xlm -= base_sell
-    state.bal_usdc += usdc_receive
-    apply_fee_xlm(state, fee_total_xlm / 2.0)
-
-    record_trade(
-        state,
-        Trade(
-            ts=now_ts(),
-            side="SELL",
-            price=bid,
-            base_amount=base_sell,
-            counter_amount=usdc_receive,
-            fee_xlm=fee_total_xlm / 2.0,
-            note=f"spread={spread_pct:.4f}%",
-        ),
-    )
-
-    return f"TRADE buy@{ask:.7f} sell@{bid:.7f} spread={spread_pct:.4f}% usdcΔ={(-usdc_spend + usdc_receive):+.6f}"
-
-
-# -----------------------------
-# Reporting
-# -----------------------------
-
-def tick_line(bid: float, ask: float, bid_amt: float, ask_amt: float, state: State) -> str:
-    spread = pct_spread(bid, ask)
-    return (
-        f"TICK bid={bid:.7f} ask={ask:.7f} "
-        f"spread={spread:.4f}% "
-        f"bid_xlm={bid_amt:.2f} ask_xlm={ask_amt:.2f} "
-        f"balUSDC={state.bal_usdc:.2f} balXLM={state.bal_xlm:.6f}"
-    )
-
-def report_line(state: State) -> str:
-    prof = rolling_profit_usdc(state, ROLLING_HOURS)
-    trades_rolling = sum(1 for t in state.trades if t.ts >= now_ts() - ROLLING_HOURS * 3600)
-    return f"REPORT {ROLLING_HOURS}h trades={trades_rolling} profit={prof:.6f} {COUNTER_CODE}"
-
-
-# -----------------------------
-# Main loop
-# -----------------------------
-
-async def run() -> None:
     if not PAPER_TRADING:
-        raise RuntimeError("This file is paper-trading only. PAPER_TRADING must stay True.")
+        raise RuntimeError("This main.py is paper-only. Set PAPER_TRADING=1.")
 
-    # Validate issuer for non-native counter assets
-    if COUNTER_CODE.upper() != "XLM" and COUNTER_ISSUER.strip() == "":
-        raise RuntimeError(
-            "COUNTER_ISSUER is required for non-native counter asset (e.g., USDC). "
-            "Set COUNTER_ISSUER in Railway variables."
-        )
+    if spr < MIN_SPREAD_PCT:
+        return None
+
+    # Depth check: require a fraction of trade size to exist at top-of-book
+    # Convert top XLM depth to USDC depth using price.
+    bid_depth_usdc = bid_xlm * bid
+    ask_depth_usdc = ask_xlm * ask
+    min_needed = TRADE_COUNTER_AMOUNT * MIN_DEPTH_MULT
+
+    if bid_depth_usdc < min_needed or ask_depth_usdc < min_needed:
+        return "skip(depth)"
+
+    # Choose trade size limited by balances & inventory caps
+    usdc_spend = min(TRADE_COUNTER_AMOUNT, state.balUSDC)
+    if usdc_spend <= 0:
+        return "skip(no-usdc)"
+
+    xlm_buy = usdc_spend / ask
+    xlm_buy = min(xlm_buy, ask_xlm)  # don't exceed top ask amount (simple)
+
+    if state.balXLM + xlm_buy > MAX_INVENTORY_XLM:
+        return "skip(max-inv)"
+
+    # Simulated "queue join" delay (very simplified)
+    queue_delay = max(0.0, POLL_SECONDS * QUEUE_JOIN_FACTOR)
+    await asyncio.sleep(queue_delay)
+
+    # Simulated fees
+    total_fee_xlm = NETWORK_FEE_XLM * OPS_PER_FILL
+
+    # BUY
+    state.balUSDC -= usdc_spend
+    state.balXLM += xlm_buy
+    apply_fee(state, total_fee_xlm / 2)
+
+    state.trades.append(Trade(
+        ts=time.time(),
+        action="BUY",
+        price=ask,
+        xlm=xlm_buy,
+        usdc=-usdc_spend,
+        spread_pct=spr,
+        note="paper",
+        fee_xlm=total_fee_xlm / 2,
+    ))
+
+    # Sell only if above min inventory
+    xlm_sell = xlm_buy
+    if state.balXLM - xlm_sell < MIN_INVENTORY_XLM:
+        return "bought-but-sell-blocked(min-inv)"
+
+    # Another small delay to mimic fill / timeout behavior
+    await asyncio.sleep(min(2.0, max(0.0, POLL_SECONDS)))
+
+    # SELL at bid, limited by top bid liquidity
+    xlm_sell = min(xlm_sell, bid_xlm)
+    if xlm_sell <= 0:
+        return "bought-but-no-bid"
+
+    usdc_get = xlm_sell * bid
+
+    state.balXLM -= xlm_sell
+    state.balUSDC += usdc_get
+    apply_fee(state, total_fee_xlm / 2)
+
+    state.trades.append(Trade(
+        ts=time.time(),
+        action="SELL",
+        price=bid,
+        xlm=xlm_sell,
+        usdc=usdc_get,
+        spread_pct=spr,
+        note="paper",
+        fee_xlm=total_fee_xlm / 2,
+    ))
+
+    pnl = (-usdc_spend + usdc_get)
+    return f"TRADE pnl={pnl:+.6f} {COUNTER_ASSET_CODE}"
+
+def fmt_tick(bid: float, ask: float, bid_xlm: float, ask_xlm: float, state: State) -> str:
+    spr = spread_pct(bid, ask)
+    return (
+        f"TICK bid={bid:.7f} ask={ask:.7f} spread={spr:.4f}% "
+        f"bid_xlm={bid_xlm:.2f} ask_xlm={ask_xlm:.2f} "
+        f"balUSDC={state.balUSDC:.2f} balXLM={state.balXLM:.6f}"
+    )
+
+def fmt_report(state: State) -> str:
+    prof, n = rolling_profit(state, ROLLING_HOURS)
+    return f"REPORT {ROLLING_HOURS}h trades={n} profit={prof:.6f} {COUNTER_ASSET_CODE}"
+
+
+# =========================
+# Main loop
+# =========================
+
+async def main_loop() -> None:
+    # sanity checks
+    if BASE_ASSET_TYPE != "native":
+        raise RuntimeError("This config expects BASE_ASSET_TYPE=native for XLM base.")
+    if COUNTER_ASSET_TYPE not in ("credit_alphanum4", "credit_alphanum12"):
+        raise RuntimeError("COUNTER_ASSET_TYPE must be credit_alphanum4 or credit_alphanum12.")
+    if COUNTER_ASSET_ISSUER.strip() == "":
+        raise RuntimeError("COUNTER_ASSET_ISSUER is required for USDC-like assets.")
 
     state = load_state()
-
+    last_print = 0.0
     last_report = 0.0
 
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while True:
             try:
-                bid, ask, bid_amt, ask_amt = await fetch_best_bid_ask(session)
-                spread = pct_spread(bid, ask)
+                ob = await fetch_orderbook(session)
+                bid, ask, bid_xlm, ask_xlm = _best_levels(ob)
+                spr = spread_pct(bid, ask)
 
-                print(tick_line(bid, ask, bid_amt, ask_amt, state), flush=True)
+                now = time.time()
 
-                action = await simulate_cycle(state, bid, ask, bid_amt, ask_amt, spread)
+                if now - last_print >= max(1, PRINT_EVERY):
+                    print(fmt_tick(bid, ask, bid_xlm, ask_xlm, state), flush=True)
+                    last_print = now
+
+                action = await try_trade_paper(state, bid, ask, bid_xlm, ask_xlm, spr)
                 if action:
                     print(action, flush=True)
 
-                # Housekeeping
-                prune_old_trades(state)
+                prune_old(state)
                 save_state(state)
 
-                # Periodic report
-                if now_ts() - last_report >= REPORT_EVERY_SECONDS:
-                    print(report_line(state), flush=True)
-                    last_report = now_ts()
+                if now - last_report >= max(1, REPORT_EVERY_SECONDS):
+                    print(fmt_report(state), flush=True)
+                    last_report = now
 
-                await asyncio.sleep(1)
+                await asyncio.sleep(max(0.1, POLL_SECONDS))
 
             except aiohttp.ClientResponseError as e:
                 print(f"HTTP error: {e.status} {e.message}", flush=True)
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
             except Exception as e:
                 print(f"ERROR: {type(e).__name__}: {e}", flush=True)
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
 
 
 def main() -> None:
-    asyncio.run(run())
+    asyncio.run(main_loop())
 
 
 if __name__ == "__main__":
     main()
+
