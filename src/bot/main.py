@@ -1,239 +1,170 @@
 import os
 import time
 import math
-import traceback
+import requests
 from datetime import datetime
 
-import ccxt
+# --------------------
+# ENV / CONFIG
+# --------------------
+HORIZON_URL = os.getenv("HORIZON_URL", "https://horizon.stellar.org").rstrip("/")
 
-# =========================
-# CONFIG (via env vars)
-# =========================
-EXCHANGE_ID = os.getenv("EXCHANGE_ID", "binance")
-SYMBOL = os.getenv("SYMBOL", "XLM/USDC")
+BASE_ASSET_TYPE = os.getenv("BASE_ASSET_TYPE", "native")  # XLM
 
-PAPER = os.getenv("PAPER", "true").lower() in ("1", "true", "yes", "y")
+COUNTER_ASSET_TYPE = os.getenv("COUNTER_ASSET_TYPE", "credit_alphanum4")
+COUNTER_ASSET_CODE = os.getenv("COUNTER_ASSET_CODE", "USDC")
+COUNTER_ASSET_ISSUER = os.getenv(
+    "COUNTER_ASSET_ISSUER",
+    "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+)
+
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1.0"))
+TRADE_COUNTER_AMOUNT = float(os.getenv("TRADE_COUNTER_AMOUNT", "10.0"))  # amount in USDC
 
-TRADE_USDC = float(os.getenv("TRADE_USDC", "10.0"))
+MIN_SPREAD_PCT = float(os.getenv("MIN_SPREAD_PCT", "0.03"))  # spread % threshold to consider
+MIN_DEPTH_MULT = float(os.getenv("MIN_DEPTH_MULT", "1.0"))   # require depth >= trade_size * mult
 
-# Spread signal threshold you had before (still used as a baseline)
-SPREAD_THRESHOLD_PCT = float(os.getenv("SPREAD_THRESHOLD_PCT", "0.02"))
-
-# --- Step 7 knobs ---
-# Fees are the big killer. There are 2 ways to set them:
-#   A) Set FEE_PER_SIDE_PCT (e.g., 0.10 means 0.10% each side => 0.20% round trip)
-#   B) OR set ROUND_TRIP_FEE_PCT directly
-FEE_PER_SIDE_PCT = float(os.getenv("FEE_PER_SIDE_PCT", "0.10"))  # 0.10% default
-ROUND_TRIP_FEE_PCT = os.getenv("ROUND_TRIP_FEE_PCT", "").strip()
-if ROUND_TRIP_FEE_PCT:
-    ROUND_TRIP_FEE_PCT = float(ROUND_TRIP_FEE_PCT)
-else:
-    ROUND_TRIP_FEE_PCT = 2.0 * FEE_PER_SIDE_PCT
-
-# Additional profit cushion required on top of fees (e.g., 0.05% or 0.10%)
-MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.05"))
-
-# Safety: do not trade if spread is crazy (bad data)
-MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "5.0"))
-
-# Print ticks every N loops
 PRINT_EVERY = int(os.getenv("PRINT_EVERY", "1"))
 
-# API keys only needed if PAPER=false
-API_KEY = os.getenv("API_KEY", "")
-API_SECRET = os.getenv("API_SECRET", "")
-
-# =========================
-# State
-# =========================
-total_net = 0.0
+# --------------------
+# STATE
+# --------------------
 trades = 0
 wins = 0
+total_net_counter = 0.0  # net P&L in counter asset (USDC)
 
-# =========================
-# Helpers
-# =========================
+# --------------------
+# HELPERS
+# --------------------
 def now_str():
     return datetime.utcnow().strftime("%b %d %Y %H:%M:%S")
 
 def pct(x):
     return f"{x:.4f}%"
 
-def safe_float(x):
-    try:
-        return float(x)
-    except Exception:
-        return float("nan")
+def get_order_book():
+    """
+    Horizon order book endpoint:
+    GET /order_book?base_asset_type=...&counter_asset_type=... (etc)
+    If base or counter is native (XLM), only type=native is needed. :contentReference[oaicite:2]{index=2}
+    """
+    params = {
+        "base_asset_type": BASE_ASSET_TYPE,
+        "counter_asset_type": COUNTER_ASSET_TYPE,
+        "counter_asset_code": COUNTER_ASSET_CODE,
+        "counter_asset_issuer": COUNTER_ASSET_ISSUER,
+    }
 
-def compute_spread_pct(bid: float, ask: float) -> float:
-    # percent spread based on bid (same as your logs)
+    url = f"{HORIZON_URL}/order_book"
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def best_level(levels):
+    """
+    levels are dicts like:
+    {'price': '0.2153', 'amount': '1234.5678'}  (amount is in base asset)
+    """
+    if not levels:
+        return None, None
+    p = float(levels[0]["price"])
+    a = float(levels[0]["amount"])
+    return p, a
+
+def spread_pct_from_bid_ask(bid, ask):
     if bid <= 0 or ask <= 0:
         return float("nan")
     return (ask - bid) / bid * 100.0
 
-def compute_required_spread_pct() -> float:
-    # ✅ Step 7: fee-aware profitability gate
-    return ROUND_TRIP_FEE_PCT + MIN_PROFIT_PCT
-
-def round_down(value: float, step: float) -> float:
-    if step <= 0:
-        return value
-    return math.floor(value / step) * step
-
-# =========================
-# Exchange setup
-# =========================
-def make_exchange():
-    klass = getattr(ccxt, EXCHANGE_ID)
-    ex = klass({
-        "enableRateLimit": True,
-    })
-    if not PAPER:
-        if not API_KEY or not API_SECRET:
-            raise RuntimeError("LIVE trading requires API_KEY and API_SECRET env vars.")
-        ex.apiKey = API_KEY
-        ex.secret = API_SECRET
-    return ex
-
-# =========================
-# Trading functions
-# =========================
-def paper_trade(bid: float, ask: float, spread_pct: float):
+def paper_capture_spread(bid, bid_amt_base, ask, ask_amt_base):
     """
-    Simulate: BUY at ask then SELL at bid immediately.
-    This still *crosses* the spread, but now we only allow it when spread >= fees+profit.
+    PAPER MODE (optimistic):
+    - BUY base (XLM) at bid price (maker buy)
+    - SELL base (XLM) at ask price (maker sell)
+    - 'fill if volume exists' -> we require depth on both best levels
+
+    bid/ask prices are in COUNTER per BASE (USDC per XLM)
+    amount in orderbook is BASE amount available at that price
     """
-    global total_net, trades, wins
+    global trades, wins, total_net_counter
 
-    # BUY at ask
-    xlm = TRADE_USDC / ask
+    # Convert desired counter amount to base amount at bid
+    desired_base = TRADE_COUNTER_AMOUNT / bid  # XLM
 
-    # SELL at bid
-    usdc_out = xlm * bid
+    # Depth checks at best levels
+    required_base = desired_base * MIN_DEPTH_MULT
+    if bid_amt_base < required_base or ask_amt_base < required_base:
+        return False, f"DEPTH too low: need_base={required_base:.6f} bid_base={bid_amt_base:.6f} ask_base={ask_amt_base:.6f}"
 
-    gross = usdc_out - TRADE_USDC  # will be negative by ~spread cost
+    # Simulate buy at bid (spend counter)
+    base_bought = desired_base
+    counter_spent = base_bought * bid
 
-    # Fee model: percent of notional each side
-    # fee_usdc ~= trade_usdc * fee% (buy) + usdc_out * fee% (sell)
-    fee_buy = TRADE_USDC * (FEE_PER_SIDE_PCT / 100.0)
-    fee_sell = usdc_out * (FEE_PER_SIDE_PCT / 100.0)
-    fee_total = fee_buy + fee_sell
+    # Simulate sell at ask (receive counter)
+    counter_received = base_bought * ask
 
-    net = gross - fee_total
-
+    net = counter_received - counter_spent  # profit in USDC
     trades += 1
     if net > 0:
         wins += 1
-    total_net += net
+    total_net_counter += net
 
-    print(f"{now_str()}  BUY  USDC={TRADE_USDC:.2f} price(ask)={ask:.6f} -> XLM={xlm:.7f}")
-    print(f"{now_str()}  SELL XLM={xlm:.7f} price(bid)={bid:.6f} -> USDC_out={usdc_out:.6f}")
-    print(f"{now_str()}  P&L gross={gross:.6f} fee={fee_total:.6f} net={net:.6f} total_net={total_net:.6f} trades={trades} winrate={(wins/max(trades,1))*100:.1f}%")
+    msg = (
+        f"TRADE base={base_bought:.6f} XLM | "
+        f"BUY@bid {bid:.7f} -> spent={counter_spent:.6f} {COUNTER_ASSET_CODE} | "
+        f"SELL@ask {ask:.7f} -> got={counter_received:.6f} {COUNTER_ASSET_CODE} | "
+        f"net={net:.6f} total_net={total_net_counter:.6f} trades={trades} winrate={(wins/max(trades,1))*100:.1f}%"
+    )
+    return True, msg
 
-def live_trade(exchange, bid: float, ask: float):
-    """
-    LIVE mode (simple market in/out) — still not a great strategy, but included because you asked for whole code.
-    WARNING: Market in/out will usually lose unless spread is huge and fees are tiny.
-    """
-    global total_net, trades, wins
-
-    # Market BUY by quote amount is not supported consistently across exchanges,
-    # so we compute base size from TRADE_USDC and ask.
-    base_amount = TRADE_USDC / ask
-
-    # Some markets have amount precision; try to respect it.
-    market = exchange.market(SYMBOL)
-    amount_step = None
-    # ccxt doesn't always give "step"; use precision if present
-    precision_amt = market.get("precision", {}).get("amount", None)
-    if precision_amt is not None:
-        # If precision is decimals, round down to that decimals
-        base_amount = float(f"{base_amount:.{precision_amt}f}")
-
-    print(f"{now_str()}  LIVE BUY  {SYMBOL} amount={base_amount}")
-
-    buy_order = exchange.create_market_buy_order(SYMBOL, base_amount)
-
-    # Small pause (optional)
-    time.sleep(0.5)
-
-    print(f"{now_str()}  LIVE SELL {SYMBOL} amount={base_amount}")
-    sell_order = exchange.create_market_sell_order(SYMBOL, base_amount)
-
-    # We can’t perfectly compute realized P&L without fills/fees parsing (varies by exchange).
-    # We'll just count the trade as executed.
-    trades += 1
-    print(f"{now_str()}  LIVE DONE trades={trades} (PnL requires fill/fee parsing per exchange)")
-
-# =========================
-# Main loop
-# =========================
 def main():
-    print("========== BOT START ==========")
-    print(f"EXCHANGE={EXCHANGE_ID} SYMBOL={SYMBOL} PAPER={PAPER}")
-    print(f"TRADE_USDC={TRADE_USDC} POLL_SECONDS={POLL_SECONDS}")
-    print(f"SPREAD_THRESHOLD_PCT={SPREAD_THRESHOLD_PCT}")
-    print(f"FEE_PER_SIDE_PCT={FEE_PER_SIDE_PCT} ROUND_TRIP_FEE_PCT={ROUND_TRIP_FEE_PCT} MIN_PROFIT_PCT={MIN_PROFIT_PCT}")
-    print(f"STEP7 REQUIRED_SPREAD_PCT={compute_required_spread_pct():.4f}%")
-    print("===============================")
+    print("========== STELLAR DEX PAPER BOT (maker capture) ==========")
+    print(f"HORIZON_URL={HORIZON_URL}")
+    print(f"PAIR: XLM (native) / {COUNTER_ASSET_CODE}:{COUNTER_ASSET_ISSUER}")
+    print(f"TRADE_COUNTER_AMOUNT={TRADE_COUNTER_AMOUNT} {COUNTER_ASSET_CODE}")
+    print(f"MIN_SPREAD_PCT={MIN_SPREAD_PCT}  MIN_DEPTH_MULT={MIN_DEPTH_MULT}")
+    print("===========================================================")
 
-    ex = make_exchange()
     loops = 0
-
     while True:
+        loops += 1
         try:
-            loops += 1
+            ob = get_order_book()
+            bids = ob.get("bids", [])
+            asks = ob.get("asks", [])
 
-            # Pull best bid/ask
-            ob = ex.fetch_order_book(SYMBOL, limit=5)
-            bid = safe_float(ob["bids"][0][0]) if ob.get("bids") else float("nan")
-            ask = safe_float(ob["asks"][0][0]) if ob.get("asks") else float("nan")
+            # Horizon orderbook: bids/asks have 'price' and 'amount' (amount is BASE asset)
+            bid, bid_amt_base = best_level(bids)  # best bid price + base depth
+            ask, ask_amt_base = best_level(asks)  # best ask price + base depth
 
-            spread_pct = compute_spread_pct(bid, ask)
+            if bid is None or ask is None:
+                print(f"{now_str()}  WARN: missing bid/ask")
+                time.sleep(POLL_SECONDS)
+                continue
+
+            spread = spread_pct_from_bid_ask(bid, ask)
 
             if loops % PRINT_EVERY == 0:
-                bids_n = len(ob.get("bids", []))
-                asks_n = len(ob.get("asks", []))
-                print(f"{now_str()}  TICK bid={bid:.6f} ask={ask:.6f} spread={pct(spread_pct)} bids={bids_n} asks={asks_n}")
+                print(
+                    f"{now_str()}  TICK bid={bid:.7f} ask={ask:.7f} "
+                    f"spread={pct(spread)} bid_base={bid_amt_base:.3f} ask_base={ask_amt_base:.3f}"
+                )
 
-            # Sanity checks
-            if not (math.isfinite(bid) and math.isfinite(ask) and math.isfinite(spread_pct)):
+            if not math.isfinite(spread) or spread <= 0:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            if spread_pct <= 0 or spread_pct > MAX_SPREAD_PCT:
-                # likely junk / stale / crazy
-                time.sleep(POLL_SECONDS)
-                continue
-
-            # You can keep your original threshold, but step 7 adds the REAL gate:
-            # ✅ Only trade if spread clears BOTH:
-            #   - your signal threshold
-            #   - required spread to cover fees + profit
-            required_spread = compute_required_spread_pct()
-            do_signal = spread_pct >= SPREAD_THRESHOLD_PCT
-            do_profit_gate = spread_pct >= required_spread
-
-            if do_signal:
-                print(f"{now_str()}  SIGNAL spread {pct(spread_pct)} >= threshold {pct(SPREAD_THRESHOLD_PCT)}")
-
-            # ✅ STEP 7: fee-aware check
-            print(f"{now_str()}  CHECK  spread={pct(spread_pct)} required={pct(required_spread)} -> {'TRADE' if (do_signal and do_profit_gate) else 'SKIP'}")
-
-            if do_signal and do_profit_gate:
-                if PAPER:
-                    print(f"{now_str()}  PAPER TRADE")
-                    paper_trade(bid, ask, spread_pct)
+            if spread >= MIN_SPREAD_PCT:
+                ok, msg = paper_capture_spread(bid, bid_amt_base, ask, ask_amt_base)
+                if ok:
+                    print(f"{now_str()}  {msg}")
                 else:
-                    print(f"{now_str()}  LIVE TRADE (market in/out) — be careful")
-                    live_trade(ex, bid, ask)
+                    print(f"{now_str()}  SKIP {msg}")
 
             time.sleep(POLL_SECONDS)
 
         except Exception as e:
             print(f"{now_str()}  ERROR: {e}")
-            traceback.print_exc()
             time.sleep(max(POLL_SECONDS, 1.0))
 
 if __name__ == "__main__":
