@@ -139,6 +139,11 @@ def load_trading_keys() -> Tuple[str, str]:
     pub = PUBLIC_KEY or kp.public_key
     return kp.secret, pub
 
+def main():
+    print("DEBUG: bot started")
+    print(f"DEBUG: BASE={BASE_CODE} issuer={BASE_ISSUER}")
+    print(f"DEBUG: QUOTE={QUOTE_CODE} issuer={QUOTE_ISSUER}")
+
 
 def submit_path_payment_strict_send(
     server: Server,
