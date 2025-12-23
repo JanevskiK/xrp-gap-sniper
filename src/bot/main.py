@@ -321,3 +321,92 @@ def main():
             asks = parse_levels(ob.get("asks", []))
 
             bid, bid_depth = best_level(bids)
+            ask, ask_depth = best_level(asks)
+
+            if bid is None or ask is None:
+                print(f"{now_str()}  WARN missing bid/ask")
+                time.sleep(POLL_SECONDS)
+                continue
+
+            s = spread_pct(bid, ask)
+
+            # quote size in XLM
+            quote_xlm = TRADE_COUNTER_AMOUNT / bid
+
+            if loops % PRINT_EVERY == 0:
+                print(
+                    f"{now_str()}  TICK bid={bid:.7f} ask={ask:.7f} spread={pct(s)} "
+                    f"bid_xlm={bid_depth:.2f} ask_xlm={ask_depth:.2f} "
+                    f"balUSDC={usdc_balance:.2f} balXLM={xlm_balance:.4f}"
+                )
+
+            # ---- process fills on any open orders ----
+            if open_buy:
+                filled = process_fills(open_buy, bids, asks, now_ts)
+                if filled > 0:
+                    print(f"{now_str()}  FILL BUY  +{filled:.4f} XLM @ {open_buy.price:.7f}")
+                if open_buy.amount_xlm <= 0:
+                    print(f"{now_str()}  DONE BUY fully filled")
+                    open_buy = None
+                elif open_buy.age(now_ts) > ORDER_TIMEOUT_SECONDS:
+                    open_buy = cancel_order(open_buy, "timeout")
+
+            if open_sell:
+                filled = process_fills(open_sell, bids, asks, now_ts)
+                if filled > 0:
+                    print(f"{now_str()}  FILL SELL -{filled:.4f} XLM @ {open_sell.price:.7f}")
+                if open_sell.amount_xlm <= 0:
+                    print(f"{now_str()}  DONE SELL fully filled")
+                    open_sell = None
+                elif open_sell.age(now_ts) > ORDER_TIMEOUT_SECONDS:
+                    open_sell = cancel_order(open_sell, "timeout")
+
+            # ---- periodic 48h report ----
+            if (now_ts - last_report_ts) >= REPORT_EVERY_SECONDS:
+                last_report_ts = now_ts
+                cnt, prof = rolling_stats(now_ts)
+                print(f"{now_str()}  REPORT {ROLLING_HOURS:.0f}h trades={cnt} profit={prof:.6f} USDC")
+
+            # ---- inventory safety ----
+            if xlm_balance > MAX_INVENTORY_XLM and open_buy:
+                open_buy = cancel_order(open_buy, "inventory too high")
+            if xlm_balance < MIN_INVENTORY_XLM and open_sell:
+                open_sell = cancel_order(open_sell, "inventory too low")
+
+            # ---- quoting logic ----
+            ok, why = can_quote(s, bid_depth, ask_depth, quote_xlm)
+            should_requote = (now_ts - last_requote_ts) >= REQUOTE_SECONDS
+
+            if ok and should_requote:
+                last_requote_ts = now_ts
+
+                # cancel/replace if top moved
+                if open_buy and open_buy.price != bid:
+                    open_buy = cancel_order(open_buy, "requote to best bid")
+                if open_sell and open_sell.price != ask:
+                    open_sell = cancel_order(open_sell, "requote to best ask")
+
+                # place BUY at best bid if we have USDC
+                if open_buy is None and usdc_balance >= (TRADE_COUNTER_AMOUNT * 1.02):
+                    open_buy = place_order("buy", bid, quote_xlm, bids, asks, now_ts)
+
+                # place SELL at best ask if we have XLM inventory to sell
+                if open_sell is None and xlm_balance >= quote_xlm:
+                    open_sell = place_order("sell", ask, quote_xlm, bids, asks, now_ts)
+
+            elif (not ok) and should_requote:
+                last_requote_ts = now_ts
+                if open_buy:
+                    open_buy = cancel_order(open_buy, f"no quote: {why}")
+                if open_sell:
+                    open_sell = cancel_order(open_sell, f"no quote: {why}")
+
+            time.sleep(POLL_SECONDS)
+
+        except Exception as e:
+            print(f"{now_str()}  ERROR: {e}")
+            time.sleep(max(POLL_SECONDS, 1.0))
+
+if __name__ == "__main__":
+    main()
+
