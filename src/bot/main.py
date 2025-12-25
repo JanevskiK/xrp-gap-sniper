@@ -1,490 +1,386 @@
 #!/usr/bin/env python3
-from __future__ import annotations
+"""
+Market-making / spread-capture bot skeleton with:
+✅ Correct 48h profit: profit48h = equity_now - equity_48h_ago (snapshot based)
+✅ Trade throttling: cooldown + minimum spread (bps)
+✅ Persistent logging (SQLite): trades + equity snapshots
+✅ Same style REPORT line you’re using
 
-import asyncio
-import json
+IMPORTANT:
+- This is a working framework. You MUST implement the exchange-specific parts:
+  - fetch_orderbook()
+  - get_balances()
+  - place_limit_buy()
+  - place_limit_sell()
+  - (optional) cancel_all_orders()
+"""
+
 import os
-import random
 import time
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional, Tuple
+import math
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Tuple, Dict
 
-import aiohttp
-
-
-# -------------------------
-# Env helpers
-# -------------------------
-
-def _env(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    return default if v is None else v
-
-def env_float(name: str, default: float) -> float:
-    v = _env(name, "").strip().strip('"')
-    return default if v == "" else float(v)
-
-def env_int(name: str, default: int) -> int:
-    v = _env(name, "").strip().strip('"')
-    return default if v == "" else int(float(v))
-
-def env_bool(name: str, default: bool = False) -> bool:
-    v = _env(name, "").strip().strip('"').lower()
-    if v == "":
-        return default
-    return v in ("1", "true", "yes", "y", "on")
-
-
-# -------------------------
-# Config (your variable names)
-# -------------------------
-
-HORIZON_URL = _env("HORIZON_URL", "https://horizon.stellar.org").strip().strip('"')
-
-BASE_ASSET_TYPE = _env("BASE_ASSET_TYPE", "native").strip().strip('"')
-
-COUNTER_ASSET_TYPE = _env("COUNTER_ASSET_TYPE", "credit_alphanum4").strip().strip('"')
-COUNTER_ASSET_CODE = _env("COUNTER_ASSET_CODE", "USDC").strip().strip('"')
-COUNTER_ASSET_ISSUER = _env("COUNTER_ASSET_ISSUER", "").strip().strip('"')
-
-POLL_SECONDS = env_float("POLL_SECONDS", 1.0)
-
-TRADE_COUNTER_AMOUNT = env_float("TRADE_COUNTER_AMOUNT", 100.0)  # USDC notional per side
-MIN_SPREAD_PCT = env_float("MIN_SPREAD_PCT", 0.03)               # percent
-MIN_DEPTH_MULT = env_float("MIN_DEPTH_MULT", 0.02)               # fraction of TRADE_COUNTER_AMOUNT required at top-of-book
-
-PRINT_EVERY = env_int("PRINT_EVERY", 1)
-
-INITIAL_USDC = env_float("INITIAL_USDC", 1000.0)
-INITIAL_XLM = env_float("INITIAL_XLM", 0.0)
-
-REQUOTE_SECONDS = env_int("REQUOTE_SECONDS", 60)
-ORDER_TIMEOUT_SECONDS = env_int("ORDER_TIMEOUT_SECONDS", 900)
-
-QUEUE_JOIN_FACTOR = env_float("QUEUE_JOIN_FACTOR", 1.0)
-FILL_RATE_CAP = env_float("FILL_RATE_CAP", 999999.0)
-
-NETWORK_FEE_XLM = env_float("NETWORK_FEE_XLM", 0.00001)
-OPS_PER_FILL = env_int("OPS_PER_FILL", 2)
-
-MAX_INVENTORY_XLM = env_float("MAX_INVENTORY_XLM", 2000.0)
-MIN_INVENTORY_XLM = env_float("MIN_INVENTORY_XLM", 0.0)
-
-STATS_FILE = _env("STATS_FILE", "/tmp/stellar_mm_trades.jsonl").strip().strip('"')
-
-REPORT_EVERY_SECONDS = env_int("REPORT_EVERY_SECONDS", 300)
-ROLLING_HOURS = env_int("ROLLING_HOURS", 48)
-
-REQUOTE_BPS = env_int("REQUOTE_BPS", 10)
-
-TARGET_XLM = env_float("TARGET_XLM", 500.0)
-BAND_XLM = env_float("BAND_XLM", 150.0)
-
-PAPER_TRADING = env_bool("PAPER_TRADING", True)
-
-
-# -------------------------
-# State / Trades
-# -------------------------
+# ----------------------------
+# Config
+# ----------------------------
 
 @dataclass
-class Trade:
-    ts: float
-    side: str                  # "BUY" or "SELL"
-    price: float               # USDC per XLM
-    xlm: float
-    usdc: float                # BUY negative, SELL positive
-    fee_xlm: float
-    note: str = ""
+class Config:
+    # Pair config (example: XLM/USDC)
+    base_asset: str = os.getenv("BASE_ASSET", "XLM")
+    quote_asset: str = os.getenv("QUOTE_ASSET", "USDC")
 
-@dataclass
-class PaperOrder:
-    created_ts: float
-    side: str                  # "BUY" or "SELL"
-    price: float               # limit price
-    xlm_amount: float          # quantity
-    remaining_xlm: float
+    # Throttling / strategy
+    min_spread_bps: float = float(os.getenv("MIN_SPREAD_BPS", "25"))  # e.g. 25 bps = 0.25%
+    trade_cooldown_s: int = int(os.getenv("TRADE_COOLDOWN_S", "120"))  # minimum seconds between filled trades
+    requote_bps: float = float(os.getenv("REQUOTE_BPS", "10"))         # printed only; or use for quote offsets
 
-@dataclass
-class State:
-    started_ts: float
-    balUSDC: float
-    balXLM: float
-    trades: List[Trade]
-    open_orders: List[PaperOrder]
-    last_quote_ts: float
-    last_report_ts: float
-    last_print_ts: float
+    # Trade sizing
+    trade_quote_amount: float = float(os.getenv("TRADE_QUOTE_AMOUNT", "10"))  # how much USDC per trade
+    min_base_lot: float = float(os.getenv("MIN_BASE_LOT", "0.5"))             # minimum base size to trade
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "started_ts": self.started_ts,
-            "balUSDC": self.balUSDC,
-            "balXLM": self.balXLM,
-            "trades": [asdict(t) for t in self.trades],
-            "open_orders": [asdict(o) for o in self.open_orders],
-            "last_quote_ts": self.last_quote_ts,
-            "last_report_ts": self.last_report_ts,
-            "last_print_ts": self.last_print_ts,
-        }
+    # Timing
+    tick_interval_s: float = float(os.getenv("TICK_INTERVAL_S", "2.0"))
+    snapshot_interval_s: int = int(os.getenv("SNAPSHOT_INTERVAL_S", "30"))    # save equity snapshot every N seconds
 
-    @staticmethod
-    def from_dict(d: Dict[str, Any]) -> "State":
-        trades = [Trade(**t) for t in d.get("trades", [])]
-        open_orders = [PaperOrder(**o) for o in d.get("open_orders", [])]
-        return State(
-            started_ts=float(d.get("started_ts", time.time())),
-            balUSDC=float(d.get("balUSDC", INITIAL_USDC)),
-            balXLM=float(d.get("balXLM", INITIAL_XLM)),
-            trades=trades,
-            open_orders=open_orders,
-            last_quote_ts=float(d.get("last_quote_ts", 0.0)),
-            last_report_ts=float(d.get("last_report_ts", 0.0)),
-            last_print_ts=float(d.get("last_print_ts", 0.0)),
-        )
+    # DB
+    db_path: str = os.getenv("DB_PATH", "bot.db")
+
+    # Safety
+    max_spread_bps: float = float(os.getenv("MAX_SPREAD_BPS", "2500"))  # ignore crazy books (25%)
+    max_price_deviation_pct: float = float(os.getenv("MAX_PRICE_DEV_PCT", "20"))  # optional sanity
 
 
-def load_state() -> State:
-    if not os.path.exists(STATS_FILE):
-        return State(time.time(), INITIAL_USDC, INITIAL_XLM, [], [], 0.0, 0.0, 0.0)
-    try:
-        with open(STATS_FILE, "r", encoding="utf-8") as f:
-            txt = f.read().strip()
-            if not txt:
-                return State(time.time(), INITIAL_USDC, INITIAL_XLM, [], [], 0.0, 0.0, 0.0)
-            return State.from_dict(json.loads(txt))
-    except Exception:
-        return State(time.time(), INITIAL_USDC, INITIAL_XLM, [], [], 0.0, 0.0, 0.0)
-
-def save_state(state: State) -> None:
-    os.makedirs(os.path.dirname(STATS_FILE), exist_ok=True)
-    with open(STATS_FILE, "w", encoding="utf-8") as f:
-        json.dump(state.to_dict(), f, ensure_ascii=False, indent=2)
+CFG = Config()
 
 
-# -------------------------
-# Horizon order book
-# -------------------------
+# ----------------------------
+# SQLite persistence
+# ----------------------------
 
-def _asset_params(prefix: str, asset_type: str, code: str, issuer: str) -> Dict[str, str]:
-    if asset_type == "native":
-        return {f"{prefix}_asset_type": "native"}
-    if code.strip() == "" or issuer.strip() == "":
-        raise RuntimeError(f"Missing {prefix} asset code/issuer for non-native asset.")
-    return {
-        f"{prefix}_asset_type": asset_type,
-        f"{prefix}_asset_code": code,
-        f"{prefix}_asset_issuer": issuer,
-    }
+def db_connect(path: str) -> sqlite3.Connection:
+    con = sqlite3.connect(path, check_same_thread=False)
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
+    return con
 
-async def fetch_best_bid_ask(session: aiohttp.ClientSession) -> Tuple[float, float, float, float]:
-    # selling = XLM (native), buying = USDC (credit)
-    url = f"{HORIZON_URL.rstrip('/')}/order_book"
-    params: Dict[str, str] = {}
-    params.update(_asset_params("selling", BASE_ASSET_TYPE, "", ""))
-    params.update(_asset_params("buying", COUNTER_ASSET_TYPE, COUNTER_ASSET_CODE, COUNTER_ASSET_ISSUER))
+def db_init(con: sqlite3.Connection) -> None:
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            side TEXT NOT NULL,               -- 'BUY' or 'SELL'
+            price REAL NOT NULL,
+            base_qty REAL NOT NULL,
+            quote_qty REAL NOT NULL,
+            fee_quote REAL NOT NULL DEFAULT 0,
+            note TEXT
+        );
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS equity_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            equity_quote REAL NOT NULL,       -- total value in quote (USDC)
+            bal_quote REAL NOT NULL,
+            bal_base REAL NOT NULL,
+            mid_price REAL NOT NULL
+        );
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS meta (
+            k TEXT PRIMARY KEY,
+            v TEXT NOT NULL
+        );
+    """)
+    con.commit()
 
-    async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
-        r.raise_for_status()
-        data = await r.json()
+def meta_get(con: sqlite3.Connection, k: str) -> Optional[str]:
+    cur = con.execute("SELECT v FROM meta WHERE k=?", (k,))
+    row = cur.fetchone()
+    return row[0] if row else None
 
-    bids = data.get("bids", [])
-    asks = data.get("asks", [])
-    if not bids or not asks:
-        raise RuntimeError("Orderbook empty (no bids or asks).")
+def meta_set(con: sqlite3.Connection, k: str, v: str) -> None:
+    con.execute("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
+    con.commit()
 
-    bid = float(bids[0]["price"])
-    bid_xlm = float(bids[0]["amount"])
-    ask = float(asks[0]["price"])
-    ask_xlm = float(asks[0]["amount"])
-    return bid, ask, bid_xlm, ask_xlm
+def log_trade(con: sqlite3.Connection, ts: int, side: str, price: float, base_qty: float, quote_qty: float, fee_quote: float = 0.0, note: str = "") -> None:
+    con.execute(
+        "INSERT INTO trades(ts,side,price,base_qty,quote_qty,fee_quote,note) VALUES(?,?,?,?,?,?,?)",
+        (ts, side, price, base_qty, quote_qty, fee_quote, note)
+    )
+    con.commit()
 
-def spread_pct(bid: float, ask: float) -> float:
-    mid = (bid + ask) / 2.0
-    if mid <= 0:
+def save_snapshot(con: sqlite3.Connection, ts: int, equity_quote: float, bal_quote: float, bal_base: float, mid_price: float) -> None:
+    con.execute(
+        "INSERT INTO equity_snapshots(ts,equity_quote,bal_quote,bal_base,mid_price) VALUES(?,?,?,?,?)",
+        (ts, equity_quote, bal_quote, bal_base, mid_price)
+    )
+    con.commit()
+
+def count_trades_since(con: sqlite3.Connection, since_ts: int) -> int:
+    cur = con.execute("SELECT COUNT(*) FROM trades WHERE ts >= ?", (since_ts,))
+    return int(cur.fetchone()[0])
+
+def last_snapshot_before(con: sqlite3.Connection, ts: int) -> Optional[Tuple[int, float]]:
+    cur = con.execute(
+        "SELECT ts, equity_quote FROM equity_snapshots WHERE ts <= ? ORDER BY ts DESC LIMIT 1",
+        (ts,)
+    )
+    row = cur.fetchone()
+    return (int(row[0]), float(row[1])) if row else None
+
+def latest_snapshot(con: sqlite3.Connection) -> Optional[Tuple[int, float]]:
+    cur = con.execute(
+        "SELECT ts, equity_quote FROM equity_snapshots ORDER BY ts DESC LIMIT 1"
+    )
+    row = cur.fetchone()
+    return (int(row[0]), float(row[1])) if row else None
+
+def last_trade_ts(con: sqlite3.Connection) -> Optional[int]:
+    cur = con.execute("SELECT ts FROM trades ORDER BY ts DESC LIMIT 1")
+    row = cur.fetchone()
+    return int(row[0]) if row else None
+
+
+# ----------------------------
+# Exchange interface (IMPLEMENT THESE)
+# ----------------------------
+
+def fetch_orderbook() -> Tuple[float, float, float, float]:
+    """
+    Return:
+      best_bid_price, best_ask_price, bid_size_in_base, ask_size_in_base
+
+    Replace with your exchange call.
+    """
+    raise NotImplementedError("Implement fetch_orderbook() for your exchange/API")
+
+def get_balances() -> Tuple[float, float]:
+    """
+    Return:
+      (bal_quote, bal_base)  e.g. (USDC, XLM)
+
+    Replace with your exchange call.
+    """
+    raise NotImplementedError("Implement get_balances() for your exchange/API")
+
+def place_limit_buy(price: float, base_qty: float) -> bool:
+    """
+    Place a BUY order for base_qty at price (quote per base).
+    Return True if filled/accepted.
+    """
+    raise NotImplementedError("Implement place_limit_buy() for your exchange/API")
+
+def place_limit_sell(price: float, base_qty: float) -> bool:
+    """
+    Place a SELL order for base_qty at price (quote per base).
+    Return True if filled/accepted.
+    """
+    raise NotImplementedError("Implement place_limit_sell() for your exchange/API")
+
+def cancel_all_orders() -> None:
+    """Optional: cancel open orders"""
+    return
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+def now_ts() -> int:
+    return int(time.time())
+
+def bps(x: float) -> float:
+    return x * 10_000.0
+
+def safe_div(a: float, b: float) -> float:
+    return a / b if b else 0.0
+
+def mid_price(bid: float, ask: float) -> float:
+    return (bid + ask) / 2.0
+
+def spread_frac(bid: float, ask: float) -> float:
+    # fraction, e.g. 0.001 = 0.1%
+    if bid <= 0:
         return 0.0
-    return (ask - bid) / mid * 100.0
+    return (ask - bid) / bid
+
+def compute_equity_quote(bal_quote: float, bal_base: float, mid: float) -> float:
+    return bal_quote + (bal_base * mid)
+
+def get_or_set_initial_equity(con: sqlite3.Connection, equity_now: float) -> float:
+    v = meta_get(con, "initial_equity_quote")
+    if v is None:
+        meta_set(con, "initial_equity_quote", f"{equity_now:.10f}")
+        return equity_now
+    return float(v)
+
+def should_trade(con: sqlite3.Connection, spread_bps: float) -> Tuple[bool, str]:
+    if spread_bps < CFG.min_spread_bps:
+        return False, f"spread<{CFG.min_spread_bps:.2f}bps"
+    if spread_bps > CFG.max_spread_bps:
+        return False, f"spread>{CFG.max_spread_bps:.2f}bps"
+    lt = last_trade_ts(con)
+    if lt is not None and (now_ts() - lt) < CFG.trade_cooldown_s:
+        return False, f"cooldown<{CFG.trade_cooldown_s}s"
+    return True, "ok"
 
 
-# -------------------------
-# Profit metrics
-# -------------------------
+# ----------------------------
+# Strategy (simple: buy then sell at ask)
+# ----------------------------
 
-def rolling_profit_usdc(trades: List[Trade], hours: int) -> Tuple[float, int]:
-    cutoff = time.time() - hours * 3600
-    p = 0.0
-    n = 0
-    for t in trades:
-        if t.ts >= cutoff:
-            p += t.usdc
-            n += 1
-    return p, n
-
-def portfolio_value_usdc(bal_usdc: float, bal_xlm: float, bid: float, ask: float) -> float:
-    mid = (bid + ask) / 2.0
-    return bal_usdc + bal_xlm * mid
-
-def prune_trades(state: State, keep_hours: int = 24 * 14) -> None:
-    cutoff = time.time() - keep_hours * 3600
-    state.trades = [t for t in state.trades if t.ts >= cutoff]
-
-
-# -------------------------
-# Market-maker behavior (paper)
-# -------------------------
-
-def inventory_skew(state: State) -> float:
+def decide_and_trade(con: sqlite3.Connection, bid: float, ask: float, bid_xlm: float, ask_xlm: float, bal_quote: float, bal_base: float) -> Optional[str]:
     """
-    Returns a multiplier that slightly biases quoting sizes
-    depending on how far you are from TARGET_XLM.
+    Very simple approach:
+    - If spread big enough: attempt a buy near bid (or at bid) with fixed quote amount
+    - Then attempt a sell near ask (or at ask) with same base size
+    This reduces random churn because cooldown limits frequency.
     """
-    if BAND_XLM <= 0:
-        return 1.0
-    delta = state.balXLM - TARGET_XLM
-    # If you have too much XLM, reduce buys; if too little XLM, reduce sells.
-    # Keep it mild.
-    skew = max(-1.0, min(1.0, delta / BAND_XLM))
-    return skew  # -1..+1
 
-def cancel_all_orders(state: State) -> None:
-    state.open_orders = []
+    sp_bps = bps(spread_frac(bid, ask))
+    ok, reason = should_trade(con, sp_bps)
+    if not ok:
+        return reason
 
-def place_quotes_if_ok(state: State, bid: float, ask: float, bid_xlm: float, ask_xlm: float, spr: float) -> None:
-    # Only quote when spread is large enough
-    if spr < MIN_SPREAD_PCT:
-        cancel_all_orders(state)
-        return
+    mid = mid_price(bid, ask)
 
-    # Depth check at top of book (in USDC terms)
-    min_needed = TRADE_COUNTER_AMOUNT * MIN_DEPTH_MULT
-    if bid_xlm * bid < min_needed or ask_xlm * ask < min_needed:
-        cancel_all_orders(state)
-        return
+    # Determine base_qty from desired quote amount at mid
+    desired_quote = min(CFG.trade_quote_amount, bal_quote)
+    if desired_quote <= 0.0:
+        return "no_quote_balance"
 
-    # Requote cadence
-    now = time.time()
-    if now - state.last_quote_ts < REQUOTE_SECONDS and state.open_orders:
-        return
+    base_qty = desired_quote / mid
+    base_qty = math.floor(base_qty * 1_000_000) / 1_000_000  # truncate to 6 decimals
+    if base_qty < CFG.min_base_lot:
+        return "base_qty_too_small"
 
-    # Clear old quotes and place new ones at current best bid/ask
-    cancel_all_orders(state)
+    # Basic liquidity check (optional)
+    if bid_xlm > 0 and base_qty > bid_xlm:
+        base_qty = bid_xlm
+    if ask_xlm > 0 and base_qty > ask_xlm:
+        base_qty = ask_xlm
+    if base_qty < CFG.min_base_lot:
+        return "not_enough_book_liquidity"
 
-    # Decide notional per side, then convert to XLM
-    buy_usdc = min(TRADE_COUNTER_AMOUNT, state.balUSDC)
-    buy_xlm = buy_usdc / bid if bid > 0 else 0.0
+    # Quotes (you can apply requote_bps offsets if you want)
+    buy_price = bid
+    sell_price = ask
 
-    sell_xlm = min(TRADE_COUNTER_AMOUNT / ask if ask > 0 else 0.0, state.balXLM)
+    # Ensure we can afford buy
+    est_cost = base_qty * buy_price
+    if est_cost > bal_quote:
+        # scale down
+        base_qty = math.floor((bal_quote / buy_price) * 1_000_000) / 1_000_000
+        if base_qty < CFG.min_base_lot:
+            return "insufficient_quote"
 
-    # Inventory controls
-    if state.balXLM + buy_xlm > MAX_INVENTORY_XLM:
-        buy_xlm = max(0.0, MAX_INVENTORY_XLM - state.balXLM)
-    if state.balXLM - sell_xlm < MIN_INVENTORY_XLM:
-        sell_xlm = max(0.0, state.balXLM - MIN_INVENTORY_XLM)
+    # 1) Buy
+    if not place_limit_buy(buy_price, base_qty):
+        return "buy_failed"
+    log_trade(con, now_ts(), "BUY", buy_price, base_qty, base_qty * buy_price, 0.0, "spread_capture")
 
-    # Mild skew based on inventory
-    skew = inventory_skew(state)
-    if skew > 0:        # too much XLM => reduce buys
-        buy_xlm *= (1.0 - 0.35 * skew)
-    elif skew < 0:      # too little XLM => reduce sells
-        sell_xlm *= (1.0 + 0.35 * skew)  # skew negative => reduces
+    # Refresh balances (recommended in real bot); here we re-use + assume filled
+    # 2) Sell (only if we have base)
+    # If your exchange has partial fills, you MUST query balances/filled qty.
+    if base_qty > (bal_base + base_qty):  # placeholder safety
+        return "unexpected_base_state"
 
-    buy_xlm = max(0.0, buy_xlm)
-    sell_xlm = max(0.0, sell_xlm)
+    if not place_limit_sell(sell_price, base_qty):
+        return "sell_failed"
+    log_trade(con, now_ts(), "SELL", sell_price, base_qty, base_qty * sell_price, 0.0, "spread_capture")
 
-    if buy_xlm > 0:
-        state.open_orders.append(PaperOrder(now, "BUY", bid, buy_xlm, buy_xlm))
-    if sell_xlm > 0:
-        state.open_orders.append(PaperOrder(now, "SELL", ask, sell_xlm, sell_xlm))
-
-    state.last_quote_ts = now
-
-def simulate_fills(state: State, bid: float, ask: float, bid_xlm: float, ask_xlm: float) -> List[str]:
-    """
-    Paper fill model:
-    - BUY limit at bid fills when market ask <= our bid (rare at top-of-book),
-      so we simulate partial fills based on bid-side activity instead.
-    - SELL limit at ask fills when market bid >= our ask (rare),
-      so we simulate partial fills based on ask-side activity instead.
-
-    This is a simplified maker simulation: the fill rate is proportional to top depth
-    and QUEUE_JOIN_FACTOR and POLL_SECONDS.
-    """
-    now = time.time()
-    notes: List[str] = []
-
-    # Expire orders
-    still_open: List[PaperOrder] = []
-    for o in state.open_orders:
-        if now - o.created_ts > ORDER_TIMEOUT_SECONDS:
-            continue
-        still_open.append(o)
-    state.open_orders = still_open
-
-    if not state.open_orders:
-        return notes
-
-    # “Fill fraction” per tick:
-    # increase with depth, but capped. queue factor reduces or increases.
-    # This isn’t perfect market reality, but it behaves like the earlier “spread capture” sim.
-    def fill_fraction(depth_xlm: float) -> float:
-        # base fraction depends on depth vs our notional, scaled by polling cadence
-        base = min(1.0, (depth_xlm / max(1e-9, (TRADE_COUNTER_AMOUNT / max(1e-9, ((bid+ask)/2))))) * 0.05)
-        # queue join factor: >1 means you join later => slower fills
-        q = max(0.2, min(5.0, QUEUE_JOIN_FACTOR))
-        frac = (base / q) * max(0.2, min(2.0, POLL_SECONDS))
-        return max(0.0, min(0.25, frac))  # cap 25% per tick
-
-    buy_fill_frac = fill_fraction(bid_xlm)
-    sell_fill_frac = fill_fraction(ask_xlm)
-
-    # Respect FILL_RATE_CAP by limiting xlm per tick
-    cap_xlm = FILL_RATE_CAP if FILL_RATE_CAP > 0 else 999999.0
-
-    total_fee_xlm = NETWORK_FEE_XLM * OPS_PER_FILL
-
-    new_orders: List[PaperOrder] = []
-
-    for o in state.open_orders:
-        if o.remaining_xlm <= 0:
-            continue
-
-        if o.side == "BUY":
-            # fill some of remaining
-            xlm_fill = min(o.remaining_xlm, o.remaining_xlm * buy_fill_frac, cap_xlm)
-            # Also require we actually have USDC
-            usdc_cost = xlm_fill * o.price
-            if usdc_cost > state.balUSDC:
-                # cannot fill more than we can pay
-                xlm_fill = max(0.0, state.balUSDC / max(1e-9, o.price))
-                usdc_cost = xlm_fill * o.price
-
-            if xlm_fill > 0:
-                state.balUSDC -= usdc_cost
-                state.balXLM += xlm_fill
-                state.balXLM = max(0.0, state.balXLM - (total_fee_xlm / 2))
-
-                state.trades.append(Trade(
-                    ts=now,
-                    side="BUY",
-                    price=o.price,
-                    xlm=xlm_fill,
-                    usdc=-usdc_cost,
-                    fee_xlm=total_fee_xlm / 2,
-                    note="paper_fill",
-                ))
-                o.remaining_xlm -= xlm_fill
-                notes.append(f"FILL BUY xlm={xlm_fill:.6f} @ {o.price:.7f}")
-
-        else:  # SELL
-            xlm_fill = min(o.remaining_xlm, o.remaining_xlm * sell_fill_frac, cap_xlm)
-            if xlm_fill > state.balXLM:
-                xlm_fill = max(0.0, state.balXLM)
-
-            if xlm_fill > 0:
-                usdc_get = xlm_fill * o.price
-                state.balXLM -= xlm_fill
-                state.balUSDC += usdc_get
-                state.balXLM = max(0.0, state.balXLM - (total_fee_xlm / 2))
-
-                state.trades.append(Trade(
-                    ts=now,
-                    side="SELL",
-                    price=o.price,
-                    xlm=xlm_fill,
-                    usdc=usdc_get,
-                    fee_xlm=total_fee_xlm / 2,
-                    note="paper_fill",
-                ))
-                o.remaining_xlm -= xlm_fill
-                notes.append(f"FILL SELL xlm={xlm_fill:.6f} @ {o.price:.7f}")
-
-        if o.remaining_xlm > 1e-9:
-            new_orders.append(o)
-
-    state.open_orders = new_orders
-    return notes
+    return "traded"
 
 
-# -------------------------
-# Logging
-# -------------------------
+# ----------------------------
+# Main loop + reporting
+# ----------------------------
 
-def fmt_tick(bid: float, ask: float, bid_xlm: float, ask_xlm: float, state: State) -> str:
-    spr = spread_pct(bid, ask)
+def report_line(con: sqlite3.Connection, bid: float, ask: float, bid_xlm: float, ask_xlm: float, bal_quote: float, bal_base: float) -> str:
+    ts = now_ts()
+    mid = mid_price(bid, ask)
+    equity_now = compute_equity_quote(bal_quote, bal_base, mid)
+
+    # Ensure initial equity stored once
+    initial = get_or_set_initial_equity(con, equity_now)
+    profit_total = equity_now - initial
+
+    # 48h profit uses snapshots
+    t48 = ts - int(48 * 3600)
+    snap48 = last_snapshot_before(con, t48)
+    if snap48 is None:
+        # If we don't have a snapshot 48h ago, fall back to the earliest snapshot we have (or 0)
+        earliest = last_snapshot_before(con, 0)
+        equity_48 = earliest[1] if earliest else equity_now
+    else:
+        equity_48 = snap48[1]
+    profit48h = equity_now - equity_48
+
+    trades_48h = count_trades_since(con, t48)
+
     return (
-        f"TICK bid={bid:.7f} ask={ask:.7f} spread={spr:.4f}% "
-        f"bid_xlm={bid_xlm:.2f} ask_xlm={ask_xlm:.2f} "
-        f"balUSDC={state.balUSDC:.2f} balXLM={state.balXLM:.6f}"
+        f"REPORT 48h trades={trades_48h} profit48h={profit48h:.6f} {CFG.quote_asset} | "
+        f"total_value={equity_now:.2f} {CFG.quote_asset} | "
+        f"profit_total={profit_total:.2f} {CFG.quote_asset} | "
+        f"open_orders=0 requote_bps={int(CFG.requote_bps)}"
     )
-
-def fmt_report(state: State, bid: float, ask: float) -> str:
-    p48, n48 = rolling_profit_usdc(state.trades, ROLLING_HOURS)
-    total_val = portfolio_value_usdc(state.balUSDC, state.balXLM, bid, ask)
-    initial_val = INITIAL_USDC + INITIAL_XLM * ((bid + ask) / 2.0)
-    p_total = total_val - initial_val
-    return (
-        f"REPORT {ROLLING_HOURS}h trades={n48} profit48h={p48:.6f} {COUNTER_ASSET_CODE} | "
-        f"total_value={total_val:.2f} {COUNTER_ASSET_CODE} | profit_total={p_total:.2f} {COUNTER_ASSET_CODE} | "
-        f"open_orders={len(state.open_orders)} requote_bps={REQUOTE_BPS}"
-    )
-
-
-# -------------------------
-# Main loop
-# -------------------------
-
-async def run() -> None:
-    if not PAPER_TRADING:
-        raise RuntimeError("This file is paper-trading only. Set PAPER_TRADING=1.")
-
-    if BASE_ASSET_TYPE != "native":
-        raise RuntimeError("Expected BASE_ASSET_TYPE=native.")
-    if COUNTER_ASSET_ISSUER.strip() == "":
-        raise RuntimeError("COUNTER_ASSET_ISSUER is required (USDC issuer).")
-
-    state = load_state()
-
-    timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        while True:
-            now = time.time()
-            try:
-                bid, ask, bid_xlm, ask_xlm = await fetch_best_bid_ask(session)
-                spr = spread_pct(bid, ask)
-
-                # Print tick
-                if now - state.last_print_ts >= max(1, PRINT_EVERY):
-                    print(fmt_tick(bid, ask, bid_xlm, ask_xlm, state), flush=True)
-                    state.last_print_ts = now
-
-                # Quote management
-                place_quotes_if_ok(state, bid, ask, bid_xlm, ask_xlm, spr)
-
-                # Fill simulation
-                fill_notes = simulate_fills(state, bid, ask, bid_xlm, ask_xlm)
-                for n in fill_notes:
-                    print(n, flush=True)
-
-                prune_trades(state)
-                save_state(state)
-
-                # Report
-                if now - state.last_report_ts >= max(1, REPORT_EVERY_SECONDS):
-                    print(fmt_report(state, bid, ask), flush=True)
-                    state.last_report_ts = now
-
-                await asyncio.sleep(max(0.1, POLL_SECONDS))
-
-            except aiohttp.ClientResponseError as e:
-                print(f"HTTP error: {e.status} {e.message}", flush=True)
-                await asyncio.sleep(2)
-            except Exception as e:
-                print(f"ERROR: {type(e).__name__}: {e}", flush=True)
-                await asyncio.sleep(2)
-
 
 def main() -> None:
-    asyncio.run(run())
+    con = db_connect(CFG.db_path)
+    db_init(con)
+
+    last_snapshot_ts = 0
+
+    while True:
+        try:
+            # 1) Fetch market
+            bid, ask, bid_xlm, ask_xlm = fetch_orderbook()
+            sp = spread_frac(bid, ask)
+            sp_bps = bps(sp)
+
+            # 2) Balances
+            bal_quote, bal_base = get_balances()
+
+            # 3) Snapshot equity periodically
+            ts = now_ts()
+            if (ts - last_snapshot_ts) >= CFG.snapshot_interval_s:
+                mid = mid_price(bid, ask)
+                eq = compute_equity_quote(bal_quote, bal_base, mid)
+                save_snapshot(con, ts, eq, bal_quote, bal_base, mid)
+                last_snapshot_ts = ts
+
+            # 4) Print tick (your style)
+            print(
+                f"TICK bid={bid:.7f} ask={ask:.7f} spread={sp*100:.4f}% "
+                f"bid_xlm={bid_xlm:.2f} ask_xlm={ask_xlm:.2f} "
+                f"bal{CFG.quote_asset}={bal_quote:.2f} bal{CFG.base_asset}={bal_base:.6f}"
+            )
+
+            # 5) Decide & trade (throttled)
+            action = decide_and_trade(con, bid, ask, bid_xlm, ask_xlm, bal_quote, bal_base)
+            if action == "traded":
+                # refresh balances for accurate report (recommended)
+                bal_quote, bal_base = get_balances()
+                print(report_line(con, bid, ask, bid_xlm, ask_xlm, bal_quote, bal_base))
+            else:
+                # Print report occasionally even if not trading
+                if ts % 60 < int(CFG.tick_interval_s):  # about once per minute
+                    print(report_line(con, bid, ask, bid_xlm, ask_xlm, bal_quote, bal_base))
+
+        except NotImplementedError as e:
+            # You haven't plugged in the exchange yet
+            print(f"ERROR: {e}")
+            break
+        except Exception as e:
+            # Keep bot alive
+            print(f"ERROR: {type(e).__name__}: {e}")
+
+        time.sleep(CFG.tick_interval_s)
 
 
 if __name__ == "__main__":
