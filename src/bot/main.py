@@ -452,12 +452,14 @@ def report_line(con: sqlite3.Connection, bid: float, ask: float, bid_xlm: float,
         o = STATE.open_order
         ord_txt = f"{o.side}@{o.price:.7f} qty={o.base_qty:.6f} age={ts-o.created_ts}s"
 
+    # ✅ IMPROVEMENT: clearer "profit_*" labels
     return (
-        f"REPORT 48h trades={trades_48h} realized48h={realized_48h:.6f} {CFG.quote_asset} | "
-        f"total_value={equity_now:.2f} {CFG.quote_asset} | "
-        f"realized_total={realized_total:.2f} {CFG.quote_asset} | "
-        f"unrealized={unrealized:.2f} {CFG.quote_asset} | "
-        f"total_pnl={total_pnl:.2f} {CFG.quote_asset} | "
+        f"REPORT 48h trades={trades_48h} "
+        f"profit_48h_realized={realized_48h:.6f} {CFG.quote_asset} | "
+        f"equity={equity_now:.2f} {CFG.quote_asset} | "
+        f"profit_realized_total={realized_total:.2f} {CFG.quote_asset} | "
+        f"profit_unrealized={unrealized:.2f} {CFG.quote_asset} | "
+        f"profit_total_now={total_pnl:.2f} {CFG.quote_asset} | "
         f"order={ord_txt} requote_bps={int(CFG.requote_bps)}"
     )
 
