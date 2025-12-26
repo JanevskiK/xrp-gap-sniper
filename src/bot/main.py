@@ -16,33 +16,32 @@ class Config:
     quote_asset: str = os.getenv("QUOTE_ASSET", "USDC")
 
     # --- Trading frequency / selectivity ---
-    # Higher = fewer trades
-    min_spread_bps: float = float(os.getenv("MIN_SPREAD_BPS", "60"))  # 60 bps = 0.60%
+    min_spread_bps: float = float(os.getenv("MIN_SPREAD_BPS", "60"))   # 60 bps = 0.60%
     trade_cooldown_s: int = int(os.getenv("TRADE_COOLDOWN_S", "240"))  # 4 minutes
 
     # --- Profit targeting ---
-    # Minimum profit you want per round-trip (before fees, in bps)
-    min_profit_bps: float = float(os.getenv("MIN_PROFIT_BPS", "25"))  # 0.25%
-    # Extra buffer above min profit to reduce trades further
+    min_profit_bps: float = float(os.getenv("MIN_PROFIT_BPS", "25"))        # 0.25%
     profit_buffer_bps: float = float(os.getenv("PROFIT_BUFFER_BPS", "10"))  # 0.10%
 
-    # --- Order behavior (simulated maker orders) ---
-    # How far from mid to place the buy (bps). Larger -> fewer fills -> fewer trades.
+    # --- Order behavior ---
     entry_offset_bps: float = float(os.getenv("ENTRY_OFFSET_BPS", "10"))  # 0.10% below mid
-    # Timeout for open orders (seconds)
-    order_timeout_s: int = int(os.getenv("ORDER_TIMEOUT_S", "900"))  # 15 minutes
+    order_timeout_s: int = int(os.getenv("ORDER_TIMEOUT_S", "900"))       # 15 minutes
 
-    # Trade size in quote (USDC) used per cycle
+    # --- Risk controls / fail-safes ---
+    max_hold_s: int = int(os.getenv("MAX_HOLD_S", "1800"))                # 30 minutes
+    stop_loss_bps: float = float(os.getenv("STOP_LOSS_BPS", "150"))       # 1.50% loss
+
+    # Trade size in quote
     trade_quote_amount: float = float(os.getenv("TRADE_QUOTE_AMOUNT", "15"))
     min_base_lot: float = float(os.getenv("MIN_BASE_LOT", "0.5"))
 
-    # Fees (in bps of quote notional per fill) - set to 0 for pure paper
-    fee_bps: float = float(os.getenv("FEE_BPS", "0"))  # e.g. 5 = 0.05%
+    # Fees (in bps of quote notional per fill) - set 0 for pure paper
+    fee_bps: float = float(os.getenv("FEE_BPS", "0"))
 
     # Paper market simulation
     start_price: float = float(os.getenv("START_PRICE", "0.215"))
-    sim_vol_bps: float = float(os.getenv("SIM_VOL_BPS", "10"))     # random walk step size (bps)
-    sim_spread_bps: float = float(os.getenv("SIM_SPREAD_BPS", "45"))  # typical spread in bps
+    sim_vol_bps: float = float(os.getenv("SIM_VOL_BPS", "10"))
+    sim_spread_bps: float = float(os.getenv("SIM_SPREAD_BPS", "45"))
 
     # Timing
     tick_interval_s: float = float(os.getenv("TICK_INTERVAL_S", "2.0"))
@@ -263,6 +262,9 @@ class StrategyState:
     def __init__(self):
         self.open_order: Optional[OpenOrder] = None
         self.last_buy_price: Optional[float] = None
+        # fail-safe tracking
+        self.entry_ts: Optional[int] = None
+        self.entry_qty: Optional[float] = None
 
 STATE = StrategyState()
 
@@ -311,6 +313,8 @@ def try_fill_order(con: sqlite3.Connection, bid: float, ask: float) -> Optional[
             if wallet_buy_fill(o.price, o.base_qty):
                 log_trade(con, ts, "BUY", o.price, o.base_qty, cost, fee, "paper_maker")
                 STATE.last_buy_price = o.price
+                STATE.entry_ts = ts
+                STATE.entry_qty = o.base_qty
 
                 target_bps = CFG.min_profit_bps + CFG.profit_buffer_bps
                 sell_price = STATE.last_buy_price * (1.0 + frac_from_bps(target_bps))
@@ -329,12 +333,55 @@ def try_fill_order(con: sqlite3.Connection, bid: float, ask: float) -> Optional[
                 log_trade(con, ts, "SELL", o.price, o.base_qty, proceeds, fee, "paper_maker")
                 STATE.open_order = None
                 STATE.last_buy_price = None
+                STATE.entry_ts = None
+                STATE.entry_qty = None
                 return "sell_filled_cycle_done"
             else:
                 STATE.open_order = None
                 return "sell_fill_failed"
 
     return None
+
+def maybe_fail_safe_exit(con: sqlite3.Connection, bid: float, ask: float) -> Optional[str]:
+    # only relevant if we're holding and waiting to SELL
+    if STATE.open_order is None or STATE.open_order.side != "SELL":
+        return None
+    if STATE.last_buy_price is None or STATE.entry_ts is None or STATE.entry_qty is None:
+        return None
+
+    ts = now_ts()
+    mid = mid_price(bid, ask)
+
+    # Loss in bps from entry
+    loss_frac = (mid - STATE.last_buy_price) / STATE.last_buy_price
+    loss_bps = bps_from_frac(loss_frac)
+
+    too_long = (ts - STATE.entry_ts) >= CFG.max_hold_s
+    too_much_loss = loss_bps <= -abs(CFG.stop_loss_bps)
+
+    if not (too_long or too_much_loss):
+        return None
+
+    # Exit immediately at bid (paper immediate)
+    exit_price = bid
+    qty = STATE.entry_qty
+
+    proceeds = exit_price * qty
+    fee = fee_quote_for_notional(proceeds)
+
+    if wallet_sell_fill(exit_price, qty):
+        note = "failsafe_exit_timeout" if too_long else "failsafe_exit_stoploss"
+        log_trade(con, ts, "SELL", exit_price, qty, proceeds, fee, note)
+
+        STATE.open_order = None
+        STATE.last_buy_price = None
+        STATE.entry_ts = None
+        STATE.entry_qty = None
+
+        reason = "timeout" if too_long else "stoploss"
+        return f"FAILSAFE_SELL_{reason}@{exit_price:.7f}"
+
+    return "FAILSAFE_SELL_FAILED"
 
 def decide_and_trade(con: sqlite3.Connection, bid: float, ask: float, bid_xlm: float, ask_xlm: float, bal_quote: float, bal_base: float) -> str:
     stale = maybe_cancel_stale_order()
@@ -345,6 +392,10 @@ def decide_and_trade(con: sqlite3.Connection, bid: float, ask: float, bid_xlm: f
     if filled:
         return filled
 
+    fs = maybe_fail_safe_exit(con, bid, ask)
+    if fs:
+        return fs
+
     if STATE.open_order is None:
         return place_new_buy(con, bid, ask, bal_quote)
 
@@ -352,7 +403,7 @@ def decide_and_trade(con: sqlite3.Connection, bid: float, ask: float, bid_xlm: f
 
 
 # ============================================================
-# REPORTING: realized vs unrealized (FIXED)
+# REPORTING: realized vs unrealized
 # ============================================================
 
 def realized_pnl_total(con: sqlite3.Connection) -> float:
@@ -452,7 +503,6 @@ def report_line(con: sqlite3.Connection, bid: float, ask: float, bid_xlm: float,
         o = STATE.open_order
         ord_txt = f"{o.side}@{o.price:.7f} qty={o.base_qty:.6f} age={ts-o.created_ts}s"
 
-    # ✅ IMPROVEMENT: clearer "profit_*" labels
     return (
         f"REPORT 48h trades={trades_48h} "
         f"profit_48h_realized={realized_48h:.6f} {CFG.quote_asset} | "
@@ -498,6 +548,7 @@ def main() -> None:
 
             if (
                 action in {"buy_filled_sell_placed", "sell_filled_cycle_done"}
+                or action.startswith("FAILSAFE_SELL_")
                 or (ts % 60 < int(CFG.tick_interval_s))
             ):
                 bal_quote, bal_base = get_balances()
