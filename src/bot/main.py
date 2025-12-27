@@ -1,567 +1,730 @@
+#!/usr/bin/env python3
+"""
+Stellar XLM/USDC market-making bot (simple spread capture).
+
+Reads config from environment variables (prints ENV CHECK + resolved config),
+tracks trades/snapshots in SQLite, and can run in:
+- LIVE mode: if SECRET_KEY is provided (submits real orders)
+- SIM mode : if SECRET_KEY is missing (no submissions; logs signals only)
+
+Required for USDC (or any credit asset):
+- QUOTE_ISSUER
+
+Recommended env vars (yours):
+BASE_ASSET="XLM"
+QUOTE_ASSET="USDC"
+MIN_SPREAD_BPS="35"
+TRADE_COOLDOWN_S="600"
+TRADE_QUOTE_AMOUNT="25"
+MIN_BASE_LOT="1.0"
+START_PRICE="0.215"
+SIM_VOL_BPS="8"
+SIM_SPREAD_BPS="45"
+TICK_INTERVAL_S="2"
+SNAPSHOT_INTERVAL_S="30"
+REQUOTE_BPS="10"
+STARTING_QUOTE="1000"
+STARTING_BASE="500"
+DB_PATH="/tmp/bot.db"
+
+Extra supported:
+HORIZON_URL="https://horizon.stellar.org"
+SECRET_KEY="S...."  (enables LIVE)
+BASE_ISSUER="..."   (if BASE_ASSET is non-native)
+QUOTE_ISSUER="..."  (required for USDC)
+MAX_OPEN_ORDERS="2"
+ORDER_TTL_S="900"
+"""
+
+from __future__ import annotations
+
 import os
 import time
 import math
+import json
 import sqlite3
-import random
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Tuple, Dict, Any, List
 
-# ============================================================
-# CONFIG
-# ============================================================
+# stellar-sdk
+from stellar_sdk import Server, Keypair, TransactionBuilder, Network, Asset
+from stellar_sdk.exceptions import BadRequestError, NotFoundError
+
+
+# -------------------------
+# Helpers / config parsing
+# -------------------------
+
+def getenv_str(key: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.getenv(key)
+    if v is None:
+        return default
+    v = v.strip()
+    return v if v != "" else default
+
+def getenv_int(key: str, default: int) -> int:
+    v = getenv_str(key, None)
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        return default
+
+def getenv_float(key: str, default: float) -> float:
+    v = getenv_str(key, None)
+    if v is None:
+        return default
+    try:
+        return float(v)
+    except ValueError:
+        return default
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def bps_to_pct(bps: float) -> float:
+    return bps / 10000.0
+
+def pct_to_bps(pct: float) -> float:
+    return pct * 10000.0
+
+def safe_float(s: Any, default: float = 0.0) -> float:
+    try:
+        return float(s)
+    except Exception:
+        return default
+
 
 @dataclass
 class Config:
-    base_asset: str = os.getenv("BASE_ASSET", "XLM")
-    quote_asset: str = os.getenv("QUOTE_ASSET", "USDC")
+    # trading pair
+    base_asset: str
+    quote_asset: str
+    base_issuer: Optional[str]
+    quote_issuer: Optional[str]
 
-    # --- Trading frequency / selectivity ---
-    min_spread_bps: float = float(os.getenv("MIN_SPREAD_BPS", "60"))   # 60 bps = 0.60%
-    trade_cooldown_s: int = int(os.getenv("TRADE_COOLDOWN_S", "240"))  # 4 minutes
+    # behavior
+    min_spread_bps: float
+    requote_bps: float
+    trade_cooldown_s: int
+    trade_quote_amount: float
+    min_base_lot: float
 
-    # --- Profit targeting ---
-    min_profit_bps: float = float(os.getenv("MIN_PROFIT_BPS", "25"))        # 0.25%
-    profit_buffer_bps: float = float(os.getenv("PROFIT_BUFFER_BPS", "10"))  # 0.10%
+    # timing
+    tick_interval_s: int
+    snapshot_interval_s: int
 
-    # --- Order behavior ---
-    entry_offset_bps: float = float(os.getenv("ENTRY_OFFSET_BPS", "10"))  # 0.10% below mid
-    order_timeout_s: int = int(os.getenv("ORDER_TIMEOUT_S", "900"))       # 15 minutes
+    # simulation knobs (used only for SIM fills / synthetic movement if you expand)
+    start_price: float
+    sim_vol_bps: float
+    sim_spread_bps: float
 
-    # --- Risk controls / fail-safes ---
-    max_hold_s: int = int(os.getenv("MAX_HOLD_S", "1800"))                # 30 minutes
-    stop_loss_bps: float = float(os.getenv("STOP_LOSS_BPS", "150"))       # 1.50% loss
+    # starting balances (SIM reference; LIVE reads actual balances)
+    starting_quote: float
+    starting_base: float
 
-    # Trade size in quote
-    trade_quote_amount: float = float(os.getenv("TRADE_QUOTE_AMOUNT", "15"))
-    min_base_lot: float = float(os.getenv("MIN_BASE_LOT", "0.5"))
+    # infra
+    horizon_url: str
+    secret_key: Optional[str]
+    db_path: str
 
-    # Fees (in bps of quote notional per fill) - set 0 for pure paper
-    fee_bps: float = float(os.getenv("FEE_BPS", "0"))
+    # extras
+    max_open_orders: int
+    order_ttl_s: int
 
-    # Paper market simulation
-    start_price: float = float(os.getenv("START_PRICE", "0.215"))
-    sim_vol_bps: float = float(os.getenv("SIM_VOL_BPS", "10"))
-    sim_spread_bps: float = float(os.getenv("SIM_SPREAD_BPS", "45"))
+    @property
+    def is_live(self) -> bool:
+        return bool(self.secret_key and self.secret_key.startswith("S"))
 
-    # Timing
-    tick_interval_s: float = float(os.getenv("TICK_INTERVAL_S", "2.0"))
-    snapshot_interval_s: int = int(os.getenv("SNAPSHOT_INTERVAL_S", "30"))
+    def validate(self) -> None:
+        if self.quote_asset.lower() != "native" and self.quote_asset.upper() != "XLM":
+            # credit asset
+            if not self.quote_issuer:
+                raise ValueError("QUOTE_ISSUER is required for non-native QUOTE_ASSET (e.g., USDC).")
+        if self.base_asset.lower() != "native" and self.base_asset.upper() != "XLM":
+            if not self.base_issuer:
+                raise ValueError("BASE_ISSUER is required for non-native BASE_ASSET.")
+        if self.trade_quote_amount <= 0:
+            raise ValueError("TRADE_QUOTE_AMOUNT must be > 0")
+        if self.min_spread_bps <= 0:
+            raise ValueError("MIN_SPREAD_BPS must be > 0")
+        if self.tick_interval_s <= 0:
+            raise ValueError("TICK_INTERVAL_S must be > 0")
+        if self.snapshot_interval_s <= 0:
+            raise ValueError("SNAPSHOT_INTERVAL_S must be > 0")
+        if self.requote_bps < 0:
+            raise ValueError("REQUOTE_BPS must be >= 0")
 
-    # Reporting
-    requote_bps: float = float(os.getenv("REQUOTE_BPS", "10"))
 
-    # Starting balances (paper)
-    starting_quote: float = float(os.getenv("STARTING_QUOTE", "1000"))
-    starting_base: float = float(os.getenv("STARTING_BASE", "0"))
+def load_config() -> Config:
+    # Your keys
+    cfg = Config(
+        base_asset=getenv_str("BASE_ASSET", "XLM").upper(),
+        quote_asset=getenv_str("QUOTE_ASSET", "USDC").upper(),
+        base_issuer=getenv_str("BASE_ISSUER", None),
+        quote_issuer=getenv_str("QUOTE_ISSUER", None),
 
-    # DB
-    db_path: str = os.getenv("DB_PATH", "bot.db")
+        min_spread_bps=getenv_float("MIN_SPREAD_BPS", 35.0),
+        requote_bps=getenv_float("REQUOTE_BPS", 10.0),
+        trade_cooldown_s=getenv_int("TRADE_COOLDOWN_S", 600),
+        trade_quote_amount=getenv_float("TRADE_QUOTE_AMOUNT", 25.0),
+        min_base_lot=getenv_float("MIN_BASE_LOT", 1.0),
 
-CFG = Config()
+        tick_interval_s=getenv_int("TICK_INTERVAL_S", 2),
+        snapshot_interval_s=getenv_int("SNAPSHOT_INTERVAL_S", 30),
+
+        start_price=getenv_float("START_PRICE", 0.215),
+        sim_vol_bps=getenv_float("SIM_VOL_BPS", 8.0),
+        sim_spread_bps=getenv_float("SIM_SPREAD_BPS", 45.0),
+
+        starting_quote=getenv_float("STARTING_QUOTE", 1000.0),
+        starting_base=getenv_float("STARTING_BASE", 500.0),
+
+        horizon_url=getenv_str("HORIZON_URL", "https://horizon.stellar.org"),
+        secret_key=getenv_str("SECRET_KEY", None),
+        db_path=getenv_str("DB_PATH", "/tmp/bot.db"),
+
+        max_open_orders=getenv_int("MAX_OPEN_ORDERS", 2),
+        order_ttl_s=getenv_int("ORDER_TTL_S", 900),
+    )
+    cfg.validate()
+    return cfg
 
 
-# ============================================================
-# SQLITE PERSISTENCE
-# ============================================================
+def print_env_check() -> None:
+    keys = [
+        "BASE_ASSET","QUOTE_ASSET","BASE_ISSUER","QUOTE_ISSUER",
+        "MIN_SPREAD_BPS","TRADE_COOLDOWN_S","TRADE_QUOTE_AMOUNT",
+        "MIN_BASE_LOT","START_PRICE","SIM_VOL_BPS","SIM_SPREAD_BPS",
+        "TICK_INTERVAL_S","SNAPSHOT_INTERVAL_S","REQUOTE_BPS",
+        "STARTING_QUOTE","STARTING_BASE","DB_PATH","HORIZON_URL",
+        "SECRET_KEY","MAX_OPEN_ORDERS","ORDER_TTL_S"
+    ]
+    print("=== ENV CHECK ===")
+    for k in keys:
+        v = os.getenv(k)
+        if k == "SECRET_KEY" and v:
+            v = v[:5] + "..." + v[-5:]
+        print(f"{k}={v!r}")
+    print("=================")
 
-def db_connect(path: str) -> sqlite3.Connection:
-    con = sqlite3.connect(path, check_same_thread=False)
-    con.execute("PRAGMA journal_mode=WAL;")
-    con.execute("PRAGMA synchronous=NORMAL;")
-    return con
 
-def db_init(con: sqlite3.Connection) -> None:
-    con.execute("""
+# -------------------------
+# DB layer
+# -------------------------
+
+class DB:
+    def __init__(self, path: str):
+        self.path = path
+        self.conn = sqlite3.connect(self.path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self._init()
+
+    def _init(self) -> None:
+        cur = self.conn.cursor()
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts INTEGER NOT NULL,
-            side TEXT NOT NULL,
-            price REAL NOT NULL,
+            ts TEXT NOT NULL,
+            side TEXT NOT NULL,           -- BUY or SELL (base side)
+            price REAL NOT NULL,          -- quote per base
             base_qty REAL NOT NULL,
             quote_qty REAL NOT NULL,
-            fee_quote REAL NOT NULL DEFAULT 0,
-            note TEXT
+            realized_pnl_quote REAL NOT NULL DEFAULT 0.0,
+            mode TEXT NOT NULL            -- SIM or LIVE
         );
-    """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS equity_snapshots (
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts INTEGER NOT NULL,
+            ts TEXT NOT NULL,
+            bid REAL NOT NULL,
+            ask REAL NOT NULL,
+            spread_bps REAL NOT NULL,
+            base_bal REAL NOT NULL,
+            quote_bal REAL NOT NULL,
             equity_quote REAL NOT NULL,
-            bal_quote REAL NOT NULL,
-            bal_base REAL NOT NULL,
-            mid_price REAL NOT NULL
+            unrealized_quote REAL NOT NULL,
+            realized_total_quote REAL NOT NULL,
+            open_order_json TEXT
         );
-    """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS meta (
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS state (
             k TEXT PRIMARY KEY,
             v TEXT NOT NULL
         );
-    """)
-    con.commit()
-
-def meta_get(con: sqlite3.Connection, k: str) -> Optional[str]:
-    cur = con.execute("SELECT v FROM meta WHERE k=?", (k,))
-    row = cur.fetchone()
-    return row[0] if row else None
-
-def meta_set(con: sqlite3.Connection, k: str, v: str) -> None:
-    con.execute(
-        "INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-        (k, v)
-    )
-    con.commit()
-
-def log_trade(
-    con: sqlite3.Connection,
-    ts: int,
-    side: str,
-    price: float,
-    base_qty: float,
-    quote_qty: float,
-    fee_quote: float = 0.0,
-    note: str = ""
-) -> None:
-    con.execute(
-        "INSERT INTO trades(ts,side,price,base_qty,quote_qty,fee_quote,note) VALUES(?,?,?,?,?,?,?)",
-        (ts, side, price, base_qty, quote_qty, fee_quote, note)
-    )
-    con.commit()
-
-def save_snapshot(con: sqlite3.Connection, ts: int, equity_quote: float, bal_quote: float, bal_base: float, mid_price: float) -> None:
-    con.execute(
-        "INSERT INTO equity_snapshots(ts,equity_quote,bal_quote,bal_base,mid_price) VALUES(?,?,?,?,?)",
-        (ts, equity_quote, bal_quote, bal_base, mid_price)
-    )
-    con.commit()
-
-def count_trades_since(con: sqlite3.Connection, since_ts: int) -> int:
-    cur = con.execute("SELECT COUNT(*) FROM trades WHERE ts >= ?", (since_ts,))
-    return int(cur.fetchone()[0])
-
-def last_trade_ts(con: sqlite3.Connection) -> Optional[int]:
-    cur = con.execute("SELECT ts FROM trades ORDER BY ts DESC LIMIT 1")
-    row = cur.fetchone()
-    return int(row[0]) if row else None
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def now_ts() -> int:
-    return int(time.time())
-
-def bps_from_frac(x: float) -> float:
-    return x * 10_000.0
-
-def frac_from_bps(bps: float) -> float:
-    return bps / 10_000.0
-
-def mid_price(bid: float, ask: float) -> float:
-    return (bid + ask) / 2.0
-
-def spread_frac(bid: float, ask: float) -> float:
-    if bid <= 0:
-        return 0.0
-    return (ask - bid) / bid
-
-def compute_equity_quote(bal_quote: float, bal_base: float, mid: float) -> float:
-    return bal_quote + (bal_base * mid)
-
-def get_or_set_initial_equity(con: sqlite3.Connection, equity_now: float) -> float:
-    v = meta_get(con, "initial_equity_quote")
-    if v is None:
-        meta_set(con, "initial_equity_quote", f"{equity_now:.10f}")
-        return equity_now
-    return float(v)
-
-def fee_quote_for_notional(quote_notional: float) -> float:
-    return quote_notional * frac_from_bps(CFG.fee_bps)
-
-def should_start_new_cycle(con: sqlite3.Connection, spread_bps: float) -> Tuple[bool, str]:
-    if spread_bps < CFG.min_spread_bps:
-        return False, f"spread<{CFG.min_spread_bps:.2f}bps"
-    lt = last_trade_ts(con)
-    if lt is not None and (now_ts() - lt) < CFG.trade_cooldown_s:
-        return False, f"cooldown<{CFG.trade_cooldown_s}s"
-    return True, "ok"
-
-def quantize_base(x: float) -> float:
-    return math.floor(x * 1_000_000) / 1_000_000
-
-
-# ============================================================
-# PAPER MARKET + WALLET
-# ============================================================
-
-class PaperMarket:
-    def __init__(self, start: float):
-        self.mid = start
-
-    def step(self) -> Tuple[float, float, float, float]:
-        step_bps = random.uniform(-CFG.sim_vol_bps, CFG.sim_vol_bps)
-        self.mid *= (1.0 + step_bps / 10_000.0)
-
-        half_spread_bps = max(1.0, CFG.sim_spread_bps) / 2.0
-        bid = self.mid * (1.0 - half_spread_bps / 10_000.0)
-        ask = self.mid * (1.0 + half_spread_bps / 10_000.0)
-
-        bid_xlm = random.uniform(50, 5000)
-        ask_xlm = random.uniform(50, 5000)
-        return bid, ask, bid_xlm, ask_xlm
-
-class PaperWallet:
-    def __init__(self, quote: float, base: float):
-        self.quote = quote
-        self.base = base
-
-PAPER_MARKET = PaperMarket(CFG.start_price)
-PAPER_WALLET = PaperWallet(CFG.starting_quote, CFG.starting_base)
-
-def fetch_orderbook() -> Tuple[float, float, float, float]:
-    return PAPER_MARKET.step()
-
-def get_balances() -> Tuple[float, float]:
-    return PAPER_WALLET.quote, PAPER_WALLET.base
-
-def wallet_buy_fill(price: float, base_qty: float) -> bool:
-    cost = price * base_qty
-    fee = fee_quote_for_notional(cost)
-    total_cost = cost + fee
-    if total_cost > PAPER_WALLET.quote:
-        return False
-    PAPER_WALLET.quote -= total_cost
-    PAPER_WALLET.base += base_qty
-    return True
-
-def wallet_sell_fill(price: float, base_qty: float) -> bool:
-    if base_qty > PAPER_WALLET.base:
-        return False
-    proceeds = price * base_qty
-    fee = fee_quote_for_notional(proceeds)
-    net = proceeds - fee
-    PAPER_WALLET.base -= base_qty
-    PAPER_WALLET.quote += net
-    return True
-
-
-# ============================================================
-# STRATEGY STATE: maker-like BUY then SELL
-# ============================================================
-
-class OpenOrder:
-    def __init__(self, side: str, price: float, base_qty: float, created_ts: int):
-        self.side = side
-        self.price = price
-        self.base_qty = base_qty
-        self.created_ts = created_ts
-
-class StrategyState:
-    def __init__(self):
-        self.open_order: Optional[OpenOrder] = None
-        self.last_buy_price: Optional[float] = None
-        # fail-safe tracking
-        self.entry_ts: Optional[int] = None
-        self.entry_qty: Optional[float] = None
-
-STATE = StrategyState()
-
-def maybe_cancel_stale_order() -> Optional[str]:
-    if STATE.open_order is None:
-        return None
-    age = now_ts() - STATE.open_order.created_ts
-    if age >= CFG.order_timeout_s:
-        side = STATE.open_order.side
-        STATE.open_order = None
-        return f"cancel_{side.lower()}_timeout"
-    return None
-
-def place_new_buy(con: sqlite3.Connection, bid: float, ask: float, bal_quote: float) -> str:
-    mid = mid_price(bid, ask)
-    sp_bps = bps_from_frac(spread_frac(bid, ask))
-    ok, reason = should_start_new_cycle(con, sp_bps)
-    if not ok:
-        return reason
-
-    desired_quote = min(CFG.trade_quote_amount, bal_quote)
-    if desired_quote <= 0:
-        return "no_quote_balance"
-
-    buy_price = mid * (1.0 - frac_from_bps(CFG.entry_offset_bps))
-    base_qty = quantize_base(desired_quote / buy_price)
-
-    if base_qty < CFG.min_base_lot:
-        return "base_qty_too_small"
-
-    STATE.open_order = OpenOrder("BUY", buy_price, base_qty, now_ts())
-    return f"place_buy@{buy_price:.7f}"
-
-def try_fill_order(con: sqlite3.Connection, bid: float, ask: float) -> Optional[str]:
-    if STATE.open_order is None:
-        return None
-
-    o = STATE.open_order
-    ts = now_ts()
-
-    if o.side == "BUY":
-        # BUY fills if ask <= our limit
-        if ask <= o.price:
-            cost = o.price * o.base_qty
-            fee = fee_quote_for_notional(cost)
-            if wallet_buy_fill(o.price, o.base_qty):
-                log_trade(con, ts, "BUY", o.price, o.base_qty, cost, fee, "paper_maker")
-                STATE.last_buy_price = o.price
-                STATE.entry_ts = ts
-                STATE.entry_qty = o.base_qty
-
-                target_bps = CFG.min_profit_bps + CFG.profit_buffer_bps
-                sell_price = STATE.last_buy_price * (1.0 + frac_from_bps(target_bps))
-                STATE.open_order = OpenOrder("SELL", sell_price, o.base_qty, ts)
-                return "buy_filled_sell_placed"
-            else:
-                STATE.open_order = None
-                return "buy_fill_failed"
-
-    elif o.side == "SELL":
-        # SELL fills if bid >= our limit
-        if bid >= o.price:
-            proceeds = o.price * o.base_qty
-            fee = fee_quote_for_notional(proceeds)
-            if wallet_sell_fill(o.price, o.base_qty):
-                log_trade(con, ts, "SELL", o.price, o.base_qty, proceeds, fee, "paper_maker")
-                STATE.open_order = None
-                STATE.last_buy_price = None
-                STATE.entry_ts = None
-                STATE.entry_qty = None
-                return "sell_filled_cycle_done"
-            else:
-                STATE.open_order = None
-                return "sell_fill_failed"
-
-    return None
-
-def maybe_fail_safe_exit(con: sqlite3.Connection, bid: float, ask: float) -> Optional[str]:
-    # only relevant if we're holding and waiting to SELL
-    if STATE.open_order is None or STATE.open_order.side != "SELL":
-        return None
-    if STATE.last_buy_price is None or STATE.entry_ts is None or STATE.entry_qty is None:
-        return None
-
-    ts = now_ts()
-    mid = mid_price(bid, ask)
-
-    # Loss in bps from entry
-    loss_frac = (mid - STATE.last_buy_price) / STATE.last_buy_price
-    loss_bps = bps_from_frac(loss_frac)
-
-    too_long = (ts - STATE.entry_ts) >= CFG.max_hold_s
-    too_much_loss = loss_bps <= -abs(CFG.stop_loss_bps)
-
-    if not (too_long or too_much_loss):
-        return None
-
-    # Exit immediately at bid (paper immediate)
-    exit_price = bid
-    qty = STATE.entry_qty
-
-    proceeds = exit_price * qty
-    fee = fee_quote_for_notional(proceeds)
-
-    if wallet_sell_fill(exit_price, qty):
-        note = "failsafe_exit_timeout" if too_long else "failsafe_exit_stoploss"
-        log_trade(con, ts, "SELL", exit_price, qty, proceeds, fee, note)
-
-        STATE.open_order = None
-        STATE.last_buy_price = None
-        STATE.entry_ts = None
-        STATE.entry_qty = None
-
-        reason = "timeout" if too_long else "stoploss"
-        return f"FAILSAFE_SELL_{reason}@{exit_price:.7f}"
-
-    return "FAILSAFE_SELL_FAILED"
-
-def decide_and_trade(con: sqlite3.Connection, bid: float, ask: float, bid_xlm: float, ask_xlm: float, bal_quote: float, bal_base: float) -> str:
-    stale = maybe_cancel_stale_order()
-    if stale:
-        return stale
-
-    filled = try_fill_order(con, bid, ask)
-    if filled:
-        return filled
-
-    fs = maybe_fail_safe_exit(con, bid, ask)
-    if fs:
-        return fs
-
-    if STATE.open_order is None:
-        return place_new_buy(con, bid, ask, bal_quote)
-
-    return "waiting"
-
-
-# ============================================================
-# REPORTING: realized vs unrealized
-# ============================================================
-
-def realized_pnl_total(con: sqlite3.Connection) -> float:
-    cur = con.execute(
-        "SELECT ts, side, price, base_qty, quote_qty, fee_quote FROM trades ORDER BY ts ASC, id ASC"
-    )
-
-    pos_base = 0.0
-    cost_quote = 0.0
-    realized = 0.0
-
-    for ts, side, price, base_qty, quote_qty, fee_quote in cur.fetchall():
-        fee_quote = float(fee_quote or 0.0)
-        base_qty = float(base_qty)
-        quote_qty = float(quote_qty)
-
-        if side.upper() == "BUY":
-            pos_base += base_qty
-            cost_quote += (quote_qty + fee_quote)
-
-        elif side.upper() == "SELL":
-            if pos_base <= 0:
-                continue
-
-            avg_cost = cost_quote / pos_base
-            removed_cost = avg_cost * base_qty
-            proceeds = quote_qty - fee_quote
-
-            realized += (proceeds - removed_cost)
-
-            pos_base -= base_qty
-            cost_quote -= removed_cost
-
-            if pos_base < 1e-12:
-                pos_base = 0.0
-                cost_quote = 0.0
-
-    return realized
-
-def realized_pnl_since(con: sqlite3.Connection, since_ts: int) -> float:
-    cur = con.execute(
-        "SELECT ts, side, base_qty, quote_qty, fee_quote FROM trades ORDER BY ts ASC, id ASC"
-    )
-
-    pos_base = 0.0
-    cost_quote = 0.0
-    realized_since = 0.0
-
-    for ts, side, base_qty, quote_qty, fee_quote in cur.fetchall():
-        ts = int(ts)
-        fee_quote = float(fee_quote or 0.0)
-        base_qty = float(base_qty)
-        quote_qty = float(quote_qty)
-
-        if side.upper() == "BUY":
-            pos_base += base_qty
-            cost_quote += (quote_qty + fee_quote)
-
-        elif side.upper() == "SELL":
-            if pos_base <= 0:
-                continue
-
-            avg_cost = cost_quote / pos_base
-            removed_cost = avg_cost * base_qty
-            proceeds = quote_qty - fee_quote
-            pnl = (proceeds - removed_cost)
-
-            if ts >= since_ts:
-                realized_since += pnl
-
-            pos_base -= base_qty
-            cost_quote -= removed_cost
-
-            if pos_base < 1e-12:
-                pos_base = 0.0
-                cost_quote = 0.0
-
-    return realized_since
-
-def report_line(con: sqlite3.Connection, bid: float, ask: float, bid_xlm: float, ask_xlm: float, bal_quote: float, bal_base: float) -> str:
-    ts = now_ts()
-    mid = mid_price(bid, ask)
-
-    equity_now = compute_equity_quote(bal_quote, bal_base, mid)
-    initial = get_or_set_initial_equity(con, equity_now)
-    total_pnl = equity_now - initial
-
-    realized_total = realized_pnl_total(con)
-    unrealized = total_pnl - realized_total
-
-    t48 = ts - int(48 * 3600)
-    realized_48h = realized_pnl_since(con, t48)
-    trades_48h = count_trades_since(con, t48)
-
-    ord_txt = "none"
-    if STATE.open_order is not None:
-        o = STATE.open_order
-        ord_txt = f"{o.side}@{o.price:.7f} qty={o.base_qty:.6f} age={ts-o.created_ts}s"
-
-    return (
-        f"REPORT 48h trades={trades_48h} "
-        f"profit_48h_realized={realized_48h:.6f} {CFG.quote_asset} | "
-        f"equity={equity_now:.2f} {CFG.quote_asset} | "
-        f"profit_realized_total={realized_total:.2f} {CFG.quote_asset} | "
-        f"profit_unrealized={unrealized:.2f} {CFG.quote_asset} | "
-        f"profit_total_now={total_pnl:.2f} {CFG.quote_asset} | "
-        f"order={ord_txt} requote_bps={int(CFG.requote_bps)}"
-    )
-
-
-# ============================================================
-# MAIN LOOP
-# ============================================================
-
-def main() -> None:
-    con = db_connect(CFG.db_path)
-    db_init(con)
-
-    last_snapshot_ts = 0
-
-    while True:
+        """)
+        self.conn.commit()
+
+    def set_state(self, k: str, v: Any) -> None:
+        cur = self.conn.cursor()
+        cur.execute("INSERT INTO state(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                    (k, json.dumps(v)))
+        self.conn.commit()
+
+    def get_state(self, k: str, default: Any = None) -> Any:
+        cur = self.conn.cursor()
+        cur.execute("SELECT v FROM state WHERE k=?", (k,))
+        row = cur.fetchone()
+        if not row:
+            return default
         try:
-            bid, ask, bid_xlm, ask_xlm = fetch_orderbook()
-            bal_quote, bal_base = get_balances()
+            return json.loads(row["v"])
+        except Exception:
+            return default
 
-            ts = now_ts()
+    def add_trade(self, ts: datetime, side: str, price: float, base_qty: float, quote_qty: float,
+                  realized_pnl_quote: float, mode: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute("""
+            INSERT INTO trades(ts, side, price, base_qty, quote_qty, realized_pnl_quote, mode)
+            VALUES(?,?,?,?,?,?,?)
+        """, (ts.isoformat(), side, price, base_qty, quote_qty, realized_pnl_quote, mode))
+        self.conn.commit()
 
-            if (ts - last_snapshot_ts) >= CFG.snapshot_interval_s:
-                mid = mid_price(bid, ask)
-                eq = compute_equity_quote(bal_quote, bal_base, mid)
-                save_snapshot(con, ts, eq, bal_quote, bal_base, mid)
-                last_snapshot_ts = ts
+    def count_trades_since(self, since: datetime) -> int:
+        cur = self.conn.cursor()
+        cur.execute("SELECT COUNT(*) AS c FROM trades WHERE ts >= ?", (since.isoformat(),))
+        return int(cur.fetchone()["c"])
 
-            sp = spread_frac(bid, ask)
-            print(
-                f"TICK bid={bid:.7f} ask={ask:.7f} spread={sp*100:.4f}% "
-                f"bid_xlm={bid_xlm:.2f} ask_xlm={ask_xlm:.2f} "
-                f"bal{CFG.quote_asset}={bal_quote:.2f} bal{CFG.base_asset}={bal_base:.6f}"
+    def realized_pnl_since(self, since: datetime) -> float:
+        cur = self.conn.cursor()
+        cur.execute("SELECT COALESCE(SUM(realized_pnl_quote),0) AS s FROM trades WHERE ts >= ?",
+                    (since.isoformat(),))
+        return float(cur.fetchone()["s"])
+
+    def realized_pnl_total(self) -> float:
+        cur = self.conn.cursor()
+        cur.execute("SELECT COALESCE(SUM(realized_pnl_quote),0) AS s FROM trades")
+        return float(cur.fetchone()["s"])
+
+    def add_snapshot(self, **kwargs) -> None:
+        cur = self.conn.cursor()
+        cur.execute("""
+            INSERT INTO snapshots(ts,bid,ask,spread_bps,base_bal,quote_bal,equity_quote,unrealized_quote,realized_total_quote,open_order_json)
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+        """, (
+            kwargs["ts"].isoformat(),
+            kwargs["bid"],
+            kwargs["ask"],
+            kwargs["spread_bps"],
+            kwargs["base_bal"],
+            kwargs["quote_bal"],
+            kwargs["equity_quote"],
+            kwargs["unrealized_quote"],
+            kwargs["realized_total_quote"],
+            kwargs.get("open_order_json"),
+        ))
+        self.conn.commit()
+
+
+# -------------------------
+# Stellar market / balances
+# -------------------------
+
+def make_asset(code: str, issuer: Optional[str]) -> Asset:
+    if code.upper() in ("XLM", "NATIVE"):
+        return Asset.native()
+    if not issuer:
+        raise ValueError(f"Issuer required for asset {code}")
+    return Asset(code.upper(), issuer)
+
+def fetch_best_bid_ask(server: Server, selling: Asset, buying: Asset) -> Tuple[float, float]:
+    """
+    For orderbook endpoint:
+      - "selling" is base asset you give
+      - "buying"  is asset you receive
+    We want price as QUOTE per BASE.
+    So we query orderbook for:
+      selling=BASE, buying=QUOTE
+    In response:
+      bids: people want to BUY selling (BASE) and pay buying (QUOTE) => bid price (QUOTE/BASE)
+      asks: people want to SELL selling (BASE) for buying (QUOTE) => ask price (QUOTE/BASE)
+    """
+    ob = server.orderbook(selling=selling, buying=buying).call()
+    bids = ob.get("bids", [])
+    asks = ob.get("asks", [])
+    if not bids or not asks:
+        raise RuntimeError("Orderbook empty (no bids/asks).")
+    best_bid = safe_float(bids[0].get("price"), 0.0)
+    best_ask = safe_float(asks[0].get("price"), 0.0)
+    if best_bid <= 0 or best_ask <= 0:
+        raise RuntimeError("Invalid bid/ask from orderbook.")
+    return best_bid, best_ask
+
+def fetch_balances(server: Server, cfg: Config) -> Tuple[float, float]:
+    """
+    Returns (base_balance, quote_balance) for the account in LIVE.
+    """
+    kp = Keypair.from_secret(cfg.secret_key)  # type: ignore[arg-type]
+    acc = server.accounts().account_id(kp.public_key).call()
+    base = cfg.base_asset
+    quote = cfg.quote_asset
+
+    def bal_for(code: str, issuer: Optional[str]) -> float:
+        if code.upper() in ("XLM", "NATIVE"):
+            for b in acc["balances"]:
+                if b["asset_type"] == "native":
+                    return safe_float(b["balance"])
+            return 0.0
+        for b in acc["balances"]:
+            if b.get("asset_code") == code.upper() and b.get("asset_issuer") == issuer:
+                return safe_float(b["balance"])
+        return 0.0
+
+    base_bal = bal_for(base, cfg.base_issuer)
+    quote_bal = bal_for(quote, cfg.quote_issuer)
+    return base_bal, quote_bal
+
+
+# -------------------------
+# Trading logic
+# -------------------------
+
+class Bot:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.db = DB(cfg.db_path)
+        self.server = Server(horizon_url=cfg.horizon_url)
+
+        self.base_asset = make_asset(cfg.base_asset, cfg.base_issuer)
+        self.quote_asset = make_asset(cfg.quote_asset, cfg.quote_issuer)
+
+        # state
+        self.last_trade_ts = self._load_last_trade_ts()
+        self.open_order = self.db.get_state("open_order", default=None)  # dict or None
+        self.last_snapshot_ts = 0.0
+
+        # SIM balances (only used if not live)
+        self.sim_base = float(cfg.starting_base)
+        self.sim_quote = float(cfg.starting_quote)
+
+        print("=== CONFIG RESOLVED ===")
+        d = asdict(cfg)
+        if d.get("secret_key"):
+            d["secret_key"] = (d["secret_key"][:5] + "..." + d["secret_key"][-5:])
+        print(json.dumps(d, indent=2))
+        print("=======================")
+        print(f"MODE: {'LIVE' if cfg.is_live else 'SIM'}")
+
+    def _load_last_trade_ts(self) -> float:
+        v = self.db.get_state("last_trade_ts", default=0.0)
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+
+    def _set_last_trade_ts(self, t: float) -> None:
+        self.last_trade_ts = t
+        self.db.set_state("last_trade_ts", t)
+
+    def _set_open_order(self, order: Optional[dict]) -> None:
+        self.open_order = order
+        self.db.set_state("open_order", order)
+
+    def _cooldown_ok(self) -> bool:
+        return (time.time() - self.last_trade_ts) >= self.cfg.trade_cooldown_s
+
+    def _spread_bps(self, bid: float, ask: float) -> float:
+        mid = (bid + ask) / 2.0
+        return ((ask - bid) / mid) * 10000.0
+
+    def _equity_quote(self, bid: float, base_bal: float, quote_bal: float) -> float:
+        # value base at bid into quote
+        return quote_bal + base_bal * bid
+
+    def _unrealized_quote(self, bid: float, equity: float) -> float:
+        # relative to starting total
+        start_equity = self.cfg.starting_quote + self.cfg.starting_base * self.cfg.start_price
+        return equity - start_equity
+
+    def _report(self, bid: float, ask: float, base_bal: float, quote_bal: float, open_order_str: str) -> None:
+        since = now_utc() - timedelta(hours=48)
+        trades_48h = self.db.count_trades_since(since)
+        realized_48h = self.db.realized_pnl_since(since)
+        realized_total = self.db.realized_pnl_total()
+
+        equity = self._equity_quote(bid, base_bal, quote_bal)
+        unreal = self._unrealized_quote(bid, equity)
+        total_now = realized_total + unreal  # simple combined view
+
+        print(
+            f"REPORT 48h trades={trades_48h} "
+            f"profit_48h_realized={realized_48h:.6f} {self.cfg.quote_asset} | "
+            f"equity={equity:.2f} {self.cfg.quote_asset} | "
+            f"profit_realized_total={realized_total:.2f} {self.cfg.quote_asset} | "
+            f"profit_unrealized={unreal:.2f} {self.cfg.quote_asset} | "
+            f"profit_total_now={total_now:.2f} {self.cfg.quote_asset} | "
+            f"order={open_order_str} requote_bps={self.cfg.requote_bps:g}"
+        )
+
+    def _maybe_snapshot(self, bid: float, ask: float, spread_bps: float, base_bal: float, quote_bal: float) -> None:
+        now = time.time()
+        if now - self.last_snapshot_ts < self.cfg.snapshot_interval_s:
+            return
+        self.last_snapshot_ts = now
+
+        equity = self._equity_quote(bid, base_bal, quote_bal)
+        unreal = self._unrealized_quote(bid, equity)
+        realized_total = self.db.realized_pnl_total()
+        self.db.add_snapshot(
+            ts=now_utc(),
+            bid=bid, ask=ask,
+            spread_bps=spread_bps,
+            base_bal=base_bal,
+            quote_bal=quote_bal,
+            equity_quote=equity,
+            unrealized_quote=unreal,
+            realized_total_quote=realized_total,
+            open_order_json=json.dumps(self.open_order) if self.open_order else None
+        )
+
+    def _place_or_requote_orders_live(self, bid: float, ask: float) -> None:
+        """
+        Simple strategy:
+        - When spread >= MIN_SPREAD_BPS and cooldown ok:
+            Place BOTH:
+              BUY base with quote slightly below mid (near bid)
+              SELL base for quote slightly above mid (near ask)
+        - Keep at most max_open_orders (we manage via single "open_order" record)
+        - Requote if market moved more than REQUOTE_BPS from our stored price.
+        """
+        # For simplicity: we manage ONE active "pair" conceptually; real management depends on offers list.
+        # This bot uses "manage_sell_offer" only and doesn't attempt sophisticated inventory mgmt.
+        # It is intentionally minimal + debuggable.
+
+        if not self._cooldown_ok():
+            return
+
+        spread = self._spread_bps(bid, ask)
+        if spread < self.cfg.min_spread_bps:
+            return
+
+        # Determine target prices
+        mid = (bid + ask) / 2.0
+        buy_price = bid  # conservative
+        sell_price = ask
+
+        # If we already have an open order record, requote if needed
+        if self.open_order:
+            # If it's too old, we drop state (actual offer may still exist; you can extend to cancel)
+            age = time.time() - float(self.open_order.get("ts", time.time()))
+            if age > self.cfg.order_ttl_s:
+                self._set_open_order(None)
+                return
+
+            cur_price = float(self.open_order.get("price", 0.0))
+            side = self.open_order.get("side")
+            # requote threshold relative to current market
+            target = sell_price if side == "SELL" else buy_price
+            if cur_price > 0:
+                move_bps = abs((target - cur_price) / cur_price) * 10000.0
+                if move_bps < self.cfg.requote_bps:
+                    return
+            # If moved enough: clear local state; next tick will place a fresh one
+            self._set_open_order(None)
+            return
+
+        # Decide what to place now: we place a SELL (inventory-based) if we have base; otherwise BUY.
+        base_bal, quote_bal = fetch_balances(self.server, self.cfg)
+
+        # Convert quote amount into base qty at chosen price
+        base_qty_for_quote = self.cfg.trade_quote_amount / max(buy_price, 1e-12)
+
+        # Inventory choice:
+        if base_bal >= max(self.cfg.min_base_lot, base_qty_for_quote * 0.9):
+            # Place SELL base for quote
+            base_qty = max(self.cfg.min_base_lot, min(base_bal, base_qty_for_quote))
+            self._submit_sell_offer(base_qty=base_qty, price=sell_price)
+            self._set_last_trade_ts(time.time())
+            self._set_open_order({
+                "ts": time.time(),
+                "side": "SELL",
+                "price": sell_price,
+                "qty": base_qty
+            })
+        elif quote_bal >= self.cfg.trade_quote_amount:
+            # Place BUY base with quote by selling quote asset? On Stellar, easiest is manage_buy_offer,
+            # but SDK supports it. We'll do manage_buy_offer.
+            base_qty = max(self.cfg.min_base_lot, base_qty_for_quote)
+            self._submit_buy_offer(base_qty=base_qty, price=buy_price)
+            self._set_last_trade_ts(time.time())
+            self._set_open_order({
+                "ts": time.time(),
+                "side": "BUY",
+                "price": buy_price,
+                "qty": base_qty
+            })
+        else:
+            # Not enough inventory
+            return
+
+    def _submit_sell_offer(self, base_qty: float, price: float) -> None:
+        kp = Keypair.from_secret(self.cfg.secret_key)  # type: ignore[arg-type]
+        account = self.server.load_account(kp.public_key)
+        tx = (
+            TransactionBuilder(
+                source_account=account,
+                network_passphrase=Network.PUBLIC_NETWORK_PASSPHRASE,
+                base_fee=100
             )
+            .append_manage_sell_offer_op(
+                selling=self.base_asset,
+                buying=self.quote_asset,
+                amount=str(round(base_qty, 7)),
+                price=str(price),
+                offer_id=0
+            )
+            .set_timeout(30)
+            .build()
+        )
+        tx.sign(kp)
+        try:
+            self.server.submit_transaction(tx)
+        except BadRequestError as e:
+            print("LIVE submit SELL offer failed:", str(e)[:300])
+            raise
 
-            action = decide_and_trade(con, bid, ask, bid_xlm, ask_xlm, bal_quote, bal_base)
+    def _submit_buy_offer(self, base_qty: float, price: float) -> None:
+        kp = Keypair.from_secret(self.cfg.secret_key)  # type: ignore[arg-type]
+        account = self.server.load_account(kp.public_key)
+        tx = (
+            TransactionBuilder(
+                source_account=account,
+                network_passphrase=Network.PUBLIC_NETWORK_PASSPHRASE,
+                base_fee=100
+            )
+            .append_manage_buy_offer_op(
+                selling=self.quote_asset,   # we pay quote
+                buying=self.base_asset,     # we receive base
+                buy_amount=str(round(base_qty, 7)),
+                price=str(price),
+                offer_id=0
+            )
+            .set_timeout(30)
+            .build()
+        )
+        tx.sign(kp)
+        try:
+            self.server.submit_transaction(tx)
+        except BadRequestError as e:
+            print("LIVE submit BUY offer failed:", str(e)[:300])
+            raise
 
-            if (
-                action in {"buy_filled_sell_placed", "sell_filled_cycle_done"}
-                or action.startswith("FAILSAFE_SELL_")
-                or (ts % 60 < int(CFG.tick_interval_s))
-            ):
-                bal_quote, bal_base = get_balances()
-                print(report_line(con, bid, ask, bid_xlm, ask_xlm, bal_quote, bal_base))
+    def _sim_step(self, bid: float, ask: float) -> None:
+        """
+        SIM logic: if spread >= threshold & cooldown ok, we "pretend fill" by crossing:
+        - If we have quote: BUY at ask (worse case)
+        - If we have base : SELL at bid
+        This is intentionally conservative (helps you debug conditions).
+        """
+        if not self._cooldown_ok():
+            return
 
-            if action not in {"waiting"} and not action.startswith("cooldown") and not action.startswith("spread<"):
-                print(f"ACTION: {action}")
+        spread = self._spread_bps(bid, ask)
+        if spread < self.cfg.min_spread_bps:
+            return
 
-        except Exception as e:
-            print(f"ERROR: {type(e).__name__}: {e}")
+        # Choose action based on inventory
+        if self.sim_quote >= self.cfg.trade_quote_amount:
+            # BUY base at ask
+            base_qty = self.cfg.trade_quote_amount / ask
+            if base_qty < self.cfg.min_base_lot:
+                return
+            self.sim_quote -= self.cfg.trade_quote_amount
+            self.sim_base += base_qty
+            self.db.add_trade(
+                ts=now_utc(),
+                side="BUY",
+                price=ask,
+                base_qty=base_qty,
+                quote_qty=self.cfg.trade_quote_amount,
+                realized_pnl_quote=0.0,
+                mode="SIM"
+            )
+            self._set_last_trade_ts(time.time())
+        elif self.sim_base >= self.cfg.min_base_lot:
+            # SELL base at bid for approximately trade_quote_amount worth (or as much as possible)
+            base_qty_target = self.cfg.trade_quote_amount / bid
+            base_qty = min(self.sim_base, max(self.cfg.min_base_lot, base_qty_target))
+            quote_got = base_qty * bid
+            self.sim_base -= base_qty
+            self.sim_quote += quote_got
+            self.db.add_trade(
+                ts=now_utc(),
+                side="SELL",
+                price=bid,
+                base_qty=base_qty,
+                quote_qty=quote_got,
+                realized_pnl_quote=0.0,
+                mode="SIM"
+            )
+            self._set_last_trade_ts(time.time())
 
-        time.sleep(CFG.tick_interval_s)
+    def run(self) -> None:
+        print("Starting bot loop...")
+        while True:
+            t0 = time.time()
+            try:
+                bid, ask = fetch_best_bid_ask(self.server, selling=self.base_asset, buying=self.quote_asset)
+                spread_bps = self._spread_bps(bid, ask)
+
+                if self.cfg.is_live:
+                    base_bal, quote_bal = fetch_balances(self.server, self.cfg)
+                else:
+                    base_bal, quote_bal = self.sim_base, self.sim_quote
+
+                # trading step
+                if self.cfg.is_live:
+                    self._place_or_requote_orders_live(bid, ask)
+                else:
+                    self._sim_step(bid, ask)
+
+                # Snapshot + report
+                self._maybe_snapshot(bid, ask, spread_bps, base_bal, quote_bal)
+
+                open_order_str = "none"
+                if self.open_order:
+                    side = self.open_order.get("side")
+                    price = self.open_order.get("price")
+                    qty = self.open_order.get("qty")
+                    age = int(time.time() - float(self.open_order.get("ts", time.time())))
+                    open_order_str = f"{side}@{price:.7f} qty={qty:.6f} age={age}s"
+
+                # Print a compact tick line
+                print(
+                    f"TICK bid={bid:.7f} ask={ask:.7f} "
+                    f"spread={spread_bps:.4f}% "
+                    f"bal{self.cfg.quote_asset}={quote_bal:.2f} "
+                    f"bal{self.cfg.base_asset}={base_bal:.6f} "
+                )
+
+                # Print report every snapshot interval boundary (or you can adjust)
+                if int(time.time()) % max(self.cfg.snapshot_interval_s, 1) == 0:
+                    self._report(bid, ask, base_bal, quote_bal, open_order_str)
+
+            except Exception as e:
+                print("ERROR:", str(e))
+
+            # sleep
+            elapsed = time.time() - t0
+            sleep_s = max(0.0, self.cfg.tick_interval_s - elapsed)
+            time.sleep(sleep_s)
+
+
+def main():
+    print_env_check()
+    cfg = load_config()
+    bot = Bot(cfg)
+    bot.run()
 
 
 if __name__ == "__main__":
     main()
+
