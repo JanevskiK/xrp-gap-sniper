@@ -9,8 +9,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, Any, Dict
 
-from stellar_sdk import Server, Keypair, TransactionBuilder, Network, Asset
-from stellar_sdk.exceptions import BadRequestError
+import ccxt
 
 
 # -------------------------
@@ -42,6 +41,12 @@ def getenv_float(key: str, default: float) -> float:
     except ValueError:
         return default
 
+def getenv_bool(key: str, default: bool = False) -> bool:
+    v = getenv_str(key, None)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -58,10 +63,15 @@ def safe_float(x: Any, default: float = 0.0) -> float:
 
 @dataclass
 class Config:
-    base_asset: str
-    quote_asset: str
-    base_issuer: Optional[str]
-    quote_issuer: Optional[str]
+    exchange_id: str
+    api_key: Optional[str]
+    api_secret: Optional[str]
+    api_password: Optional[str]
+    use_testnet: bool
+
+    symbol: str                  # e.g. "XRP/USDT"
+    base_asset: str              # derived from symbol
+    quote_asset: str             # derived from symbol
 
     min_spread_bps: float
     requote_bps: float
@@ -72,37 +82,20 @@ class Config:
     tick_interval_s: int
     snapshot_interval_s: int
 
-    start_price: float
-    sim_vol_bps: float
-    sim_spread_bps: float
-
-    starting_quote: float
-    starting_base: float
-
-    horizon_url: str
-    secret_key: Optional[str]
-    db_path: str
-
     max_open_orders: int
     order_ttl_s: int
 
-    # ✅ Improvement: realize profit rules
-    take_profit_bps: float          # e.g. 12 bps = 0.12%
-    max_hold_s: int                 # force exit after this time if profitable enough
-    min_exit_profit_bps: float      # exit-on-timeout only if >= this bps
+    take_profit_bps: float
+    max_hold_s: int
+    min_exit_profit_bps: float
 
-    @property
-    def is_live(self) -> bool:
-        return bool(self.secret_key and self.secret_key.startswith("S"))
+    db_path: str
 
     def validate(self) -> None:
-        if self.quote_asset.upper() not in ("XLM", "NATIVE"):
-            if not self.quote_issuer:
-                raise ValueError("QUOTE_ISSUER is required for non-native QUOTE_ASSET (e.g., USDC).")
-        if self.base_asset.upper() not in ("XLM", "NATIVE"):
-            if not self.base_issuer:
-                raise ValueError("BASE_ISSUER is required for non-native BASE_ASSET.")
-
+        if "/" not in self.symbol:
+            raise ValueError('SYMBOL must look like "XRP/USDT"')
+        if not self.api_key or not self.api_secret:
+            raise ValueError("API_KEY and API_SECRET are required for LIVE trading.")
         if self.trade_quote_amount <= 0:
             raise ValueError("TRADE_QUOTE_AMOUNT must be > 0")
         if self.min_spread_bps <= 0:
@@ -113,7 +106,6 @@ class Config:
             raise ValueError("SNAPSHOT_INTERVAL_S must be > 0")
         if self.requote_bps < 0:
             raise ValueError("REQUOTE_BPS must be >= 0")
-
         if self.take_profit_bps < 0:
             raise ValueError("TAKE_PROFIT_BPS must be >= 0")
         if self.max_hold_s < 0:
@@ -124,67 +116,61 @@ class Config:
 
 def print_env_check() -> None:
     keys = [
-        "HORIZON_URL",
-        "BASE_ASSET","QUOTE_ASSET","BASE_ISSUER","QUOTE_ISSUER",
+        "EXCHANGE","API_KEY","API_SECRET","API_PASSWORD","USE_TESTNET",
+        "SYMBOL",
         "MIN_SPREAD_BPS","REQUOTE_BPS","TRADE_COOLDOWN_S","TRADE_QUOTE_AMOUNT","MIN_BASE_LOT",
-        "START_PRICE","SIM_VOL_BPS","SIM_SPREAD_BPS",
         "TICK_INTERVAL_S","SNAPSHOT_INTERVAL_S",
-        "STARTING_QUOTE","STARTING_BASE",
         "DB_PATH","MAX_OPEN_ORDERS","ORDER_TTL_S",
-        # ✅ Improvement envs
         "TAKE_PROFIT_BPS","MAX_HOLD_S","MIN_EXIT_PROFIT_BPS",
-        "SECRET_KEY",
     ]
     print("=== ENV CHECK ===")
     for k in keys:
         v = os.getenv(k)
-        if k == "SECRET_KEY" and v:
-            v = v[:5] + "..." + v[-5:]
+        if k in ("API_KEY","API_SECRET","API_PASSWORD") and v:
+            v = v[:3] + "..." + v[-3:]
         print(f"{k}={v!r}")
     print("=================")
 
 
 def load_config() -> Config:
+    symbol = (getenv_str("SYMBOL", "XRP/USDT") or "XRP/USDT").upper()
+    base, quote = symbol.split("/", 1)
+
     cfg = Config(
-        base_asset=getenv_str("BASE_ASSET", "XLM").upper(),
-        quote_asset=getenv_str("QUOTE_ASSET", "USDC").upper(),
-        base_issuer=getenv_str("BASE_ISSUER", None),
-        quote_issuer=getenv_str("QUOTE_ISSUER", None),
+        exchange_id=(getenv_str("EXCHANGE", "binance") or "binance").lower(),
+        api_key=getenv_str("API_KEY", None),
+        api_secret=getenv_str("API_SECRET", None),
+        api_password=getenv_str("API_PASSWORD", None),
+        use_testnet=getenv_bool("USE_TESTNET", False),
+
+        symbol=symbol,
+        base_asset=base,
+        quote_asset=quote,
 
         min_spread_bps=getenv_float("MIN_SPREAD_BPS", 35.0),
         requote_bps=getenv_float("REQUOTE_BPS", 10.0),
         trade_cooldown_s=getenv_int("TRADE_COOLDOWN_S", 600),
         trade_quote_amount=getenv_float("TRADE_QUOTE_AMOUNT", 25.0),
-        min_base_lot=getenv_float("MIN_BASE_LOT", 1.0),
+        min_base_lot=getenv_float("MIN_BASE_LOT", 5.0),
 
         tick_interval_s=getenv_int("TICK_INTERVAL_S", 2),
         snapshot_interval_s=getenv_int("SNAPSHOT_INTERVAL_S", 30),
 
-        start_price=getenv_float("START_PRICE", 0.215),
-        sim_vol_bps=getenv_float("SIM_VOL_BPS", 8.0),
-        sim_spread_bps=getenv_float("SIM_SPREAD_BPS", 45.0),
-
-        starting_quote=getenv_float("STARTING_QUOTE", 1000.0),
-        starting_base=getenv_float("STARTING_BASE", 500.0),
-
-        horizon_url=getenv_str("HORIZON_URL", "https://horizon.stellar.org"),
-        secret_key=getenv_str("SECRET_KEY", None),
-        db_path=getenv_str("DB_PATH", "/tmp/bot.db"),
-
-        max_open_orders=getenv_int("MAX_OPEN_ORDERS", 2),
+        max_open_orders=getenv_int("MAX_OPEN_ORDERS", 1),
         order_ttl_s=getenv_int("ORDER_TTL_S", 900),
 
-        # ✅ Improvement defaults: will realize profit more often
-        take_profit_bps=getenv_float("TAKE_PROFIT_BPS", 12.0),          # 0.12%
-        max_hold_s=getenv_int("MAX_HOLD_S", 20 * 60),                   # 20min
-        min_exit_profit_bps=getenv_float("MIN_EXIT_PROFIT_BPS", 2.0),   # 0.02%
+        take_profit_bps=getenv_float("TAKE_PROFIT_BPS", 12.0),
+        max_hold_s=getenv_int("MAX_HOLD_S", 20 * 60),
+        min_exit_profit_bps=getenv_float("MIN_EXIT_PROFIT_BPS", 2.0),
+
+        db_path=getenv_str("DB_PATH", "/tmp/bot.db") or "/tmp/bot.db",
     )
     cfg.validate()
     return cfg
 
 
 # -------------------------
-# DB
+# DB (unchanged)
 # -------------------------
 
 class DB:
@@ -290,44 +276,60 @@ class DB:
 
 
 # -------------------------
-# Stellar
+# Exchange (ccxt)
 # -------------------------
 
-def make_asset(code: str, issuer: Optional[str]) -> Asset:
-    if code.upper() in ("XLM", "NATIVE"):
-        return Asset.native()
-    if not issuer:
-        raise ValueError(f"Issuer required for asset {code}")
-    return Asset(code.upper(), issuer)
+def make_exchange(cfg: Config) -> ccxt.Exchange:
+    if not hasattr(ccxt, cfg.exchange_id):
+        raise ValueError(f"Unknown exchange id: {cfg.exchange_id}")
 
-def fetch_best_bid_ask(server: Server, base: Asset, quote: Asset) -> Tuple[float, float]:
-    ob = server.orderbook(selling=base, buying=quote).call()
-    bids = ob.get("bids", [])
-    asks = ob.get("asks", [])
-    if not bids or not asks:
-        raise RuntimeError("Orderbook empty (no bids/asks).")
-    best_bid = safe_float(bids[0].get("price"), 0.0)
-    best_ask = safe_float(asks[0].get("price"), 0.0)
-    if best_bid <= 0 or best_ask <= 0:
-        raise RuntimeError("Invalid bid/ask from orderbook.")
-    return best_bid, best_ask
+    klass = getattr(ccxt, cfg.exchange_id)
+    ex = klass({
+        "apiKey": cfg.api_key,
+        "secret": cfg.api_secret,
+        "password": cfg.api_password or None,
+        "enableRateLimit": True,
+        "options": {},
+    })
 
-def fetch_balances(server: Server, cfg: Config) -> Tuple[float, float]:
-    kp = Keypair.from_secret(cfg.secret_key)  # type: ignore[arg-type]
-    acc = server.accounts().account_id(kp.public_key).call()
+    # Testnet support (primarily Binance here; others differ)
+    if cfg.exchange_id == "binance" and cfg.use_testnet:
+        ex.set_sandbox_mode(True)
 
-    def bal_for(code: str, issuer: Optional[str]) -> float:
-        if code.upper() in ("XLM", "NATIVE"):
-            for b in acc["balances"]:
-                if b["asset_type"] == "native":
-                    return safe_float(b["balance"])
-            return 0.0
-        for b in acc["balances"]:
-            if b.get("asset_code") == code.upper() and b.get("asset_issuer") == issuer:
-                return safe_float(b["balance"])
-        return 0.0
+    ex.load_markets()
+    if cfg.symbol not in ex.markets:
+        raise ValueError(f"Symbol {cfg.symbol} not found on {cfg.exchange_id}.")
+    return ex
 
-    return bal_for(cfg.base_asset, cfg.base_issuer), bal_for(cfg.quote_asset, cfg.quote_issuer)
+def fetch_best_bid_ask(ex: ccxt.Exchange, symbol: str) -> Tuple[float, float]:
+    t = ex.fetch_ticker(symbol)
+    bid = safe_float(t.get("bid"), 0.0)
+    ask = safe_float(t.get("ask"), 0.0)
+    if bid <= 0 or ask <= 0:
+        # fallback to orderbook
+        ob = ex.fetch_order_book(symbol, limit=5)
+        bids = ob.get("bids") or []
+        asks = ob.get("asks") or []
+        if not bids or not asks:
+            raise RuntimeError("Orderbook empty.")
+        bid = safe_float(bids[0][0], 0.0)
+        ask = safe_float(asks[0][0], 0.0)
+    if bid <= 0 or ask <= 0:
+        raise RuntimeError("Invalid bid/ask.")
+    return bid, ask
+
+def fetch_balances(ex: ccxt.Exchange, base: str, quote: str) -> Tuple[float, float]:
+    b = ex.fetch_balance()
+    base_free = safe_float(((b.get(base) or {}).get("free")), 0.0)
+    quote_free = safe_float(((b.get(quote) or {}).get("free")), 0.0)
+    return base_free, quote_free
+
+def round_amount_to_market(ex: ccxt.Exchange, symbol: str, amount: float) -> float:
+    # ccxt helper (respects step size)
+    return safe_float(ex.amount_to_precision(symbol, amount), 0.0)
+
+def round_price_to_market(ex: ccxt.Exchange, symbol: str, price: float) -> float:
+    return safe_float(ex.price_to_precision(symbol, price), 0.0)
 
 
 # -------------------------
@@ -335,41 +337,29 @@ def fetch_balances(server: Server, cfg: Config) -> Tuple[float, float]:
 # -------------------------
 
 class Bot:
-    """
-    ✅ Improvement added:
-    - Tracks a "position" (entry price/cost) so SELL produces realized profit
-    - Uses TAKE_PROFIT_BPS + MAX_HOLD_S (+ MIN_EXIT_PROFIT_BPS) to force realizing profit
-    - In LIVE mode, detects fills by balance deltas and records realized profit into DB
-    """
-
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.db = DB(cfg.db_path)
-        self.server = Server(horizon_url=cfg.horizon_url)
-
-        self.base_asset = make_asset(cfg.base_asset, cfg.base_issuer)
-        self.quote_asset = make_asset(cfg.quote_asset, cfg.quote_issuer)
+        self.ex = make_exchange(cfg)
 
         self.last_trade_ts = self._load_last_trade_ts()
         self.open_order = self.db.get_state("open_order", default=None)
         self.last_snapshot_ts = 0.0
 
-        self.sim_base = float(cfg.starting_base)
-        self.sim_quote = float(cfg.starting_quote)
-
-        # ✅ Improvement: position state (cost basis)
-        self.position = self.db.get_state("position", default=None)  # dict or None
-
-        # ✅ Improvement: last balances (for LIVE fill detection)
-        self.last_bal = self.db.get_state("last_bal", default=None)  # {"base":..., "quote":..., "ts":...}
+        # Position state (cost basis)
+        self.position = self.db.get_state("position", default=None)
 
         print("=== CONFIG RESOLVED ===")
         d = asdict(cfg)
-        if d.get("secret_key"):
-            d["secret_key"] = (d["secret_key"][:5] + "..." + d["secret_key"][-5:])
+        if d.get("api_key"):
+            d["api_key"] = d["api_key"][:3] + "..." + d["api_key"][-3:]
+        if d.get("api_secret"):
+            d["api_secret"] = d["api_secret"][:3] + "..." + d["api_secret"][-3:]
+        if d.get("api_password"):
+            d["api_password"] = d["api_password"][:3] + "..." + d["api_password"][-3:]
         print(json.dumps(d, indent=2))
         print("=======================")
-        print(f"MODE: {'LIVE' if cfg.is_live else 'SIM'}")
+        print("MODE: LIVE (exchange)")
 
     # -------------------------
     # State helpers
@@ -394,10 +384,6 @@ class Bot:
         self.position = pos
         self.db.set_state("position", pos)
 
-    def _set_last_bal(self, base_bal: float, quote_bal: float) -> None:
-        self.last_bal = {"base": float(base_bal), "quote": float(quote_bal), "ts": time.time()}
-        self.db.set_state("last_bal", self.last_bal)
-
     def _cooldown_ok(self) -> bool:
         return (time.time() - self.last_trade_ts) >= self.cfg.trade_cooldown_s
 
@@ -413,10 +399,6 @@ class Bot:
         return quote_bal + base_bal * bid
 
     def _position_unrealized(self, bid: float) -> float:
-        """
-        ✅ Improvement: unrealized is ONLY the open position PnL (paper profit),
-        not "equity minus start".
-        """
         if not self.position:
             return 0.0
         base_qty = float(self.position.get("base_qty", 0.0))
@@ -484,91 +466,22 @@ class Bot:
         return int(time.time() - ts)
 
     def _should_force_exit(self, bid: float) -> Tuple[bool, str]:
-        """
-        ✅ Improvement: force realizing profit.
-        - take-profit if gain_bps >= TAKE_PROFIT_BPS
-        - max-hold exit if age >= MAX_HOLD_S AND gain_bps >= MIN_EXIT_PROFIT_BPS
-        """
         if not self.position:
             return False, ""
-
         gain_bps = self._pos_gain_bps(bid)
         age_s = self._pos_age_s()
 
         if gain_bps >= self.cfg.take_profit_bps:
             return True, f"take_profit gain={gain_bps:.2f}bps"
-
         if self.cfg.max_hold_s > 0 and age_s >= self.cfg.max_hold_s and gain_bps >= self.cfg.min_exit_profit_bps:
             return True, f"max_hold age={age_s}s gain={gain_bps:.2f}bps"
-
         return False, ""
-
-    # -------------------------
-    # Offer submit
-    # -------------------------
-
-    def _submit_sell_offer(self, base_qty: float, price: float) -> None:
-        kp = Keypair.from_secret(self.cfg.secret_key)  # type: ignore[arg-type]
-        account = self.server.load_account(kp.public_key)
-
-        tx = (
-            TransactionBuilder(
-                source_account=account,
-                network_passphrase=Network.PUBLIC_NETWORK_PASSPHRASE,
-                base_fee=100
-            )
-            .append_manage_sell_offer_op(
-                selling=self.base_asset,
-                buying=self.quote_asset,
-                amount=str(round(base_qty, 7)),
-                price=str(price),
-                offer_id=0
-            )
-            .set_timeout(30)
-            .build()
-        )
-        tx.sign(kp)
-        try:
-            self.server.submit_transaction(tx)
-        except BadRequestError as e:
-            print("LIVE submit SELL offer failed:", str(e)[:350])
-            raise
-
-    def _submit_buy_offer(self, base_qty: float, price: float) -> None:
-        kp = Keypair.from_secret(self.cfg.secret_key)  # type: ignore[arg-type]
-        account = self.server.load_account(kp.public_key)
-
-        tx = (
-            TransactionBuilder(
-                source_account=account,
-                network_passphrase=Network.PUBLIC_NETWORK_PASSPHRASE,
-                base_fee=100
-            )
-            .append_manage_buy_offer_op(
-                selling=self.quote_asset,
-                buying=self.base_asset,
-                buy_amount=str(round(base_qty, 7)),
-                price=str(price),
-                offer_id=0
-            )
-            .set_timeout(30)
-            .build()
-        )
-        tx.sign(kp)
-        try:
-            self.server.submit_transaction(tx)
-        except BadRequestError as e:
-            print("LIVE submit BUY offer failed:", str(e)[:350])
-            raise
 
     # -------------------------
     # Position + realized pnl accounting
     # -------------------------
 
-    def _apply_buy_to_position(self, ts: datetime, filled_base: float, spent_quote: float, avg_price: float, mode: str) -> None:
-        """
-        Update position cost basis.
-        """
+    def _apply_buy_to_position(self, ts: datetime, filled_base: float, spent_quote: float, avg_price: float) -> None:
         if filled_base <= 0 or spent_quote <= 0:
             return
 
@@ -580,7 +493,6 @@ class Bot:
                 "entry_cost_quote": float(spent_quote),
             })
         else:
-            # Weighted average cost basis (add)
             base_qty = float(self.position.get("base_qty", 0.0))
             entry_cost = float(self.position.get("entry_cost_quote", 0.0))
 
@@ -588,25 +500,18 @@ class Bot:
             new_cost = entry_cost + spent_quote
             new_entry_price = (new_cost / new_base) if new_base > 0 else float(avg_price)
 
-            # keep original entry_ts (or reset; your call). Here we keep first entry_ts.
             self.position["base_qty"] = float(new_base)
             self.position["entry_cost_quote"] = float(new_cost)
             self.position["entry_price"] = float(new_entry_price)
             self._set_position(self.position)
 
-        # trade record (realized_pnl_quote=0 for BUY)
-        self.db.add_trade(ts, "BUY", float(avg_price), float(filled_base), float(spent_quote), 0.0, mode)
+        self.db.add_trade(ts, "BUY", float(avg_price), float(filled_base), float(spent_quote), 0.0, "LIVE")
 
-    def _apply_sell_from_position(self, ts: datetime, sold_base: float, received_quote: float, avg_price: float, mode: str) -> float:
-        """
-        Reduce/close position and compute realized pnl on the sold portion.
-        Returns realized pnl quote (>= or <= 0).
-        """
+    def _apply_sell_from_position(self, ts: datetime, sold_base: float, received_quote: float, avg_price: float) -> float:
         if sold_base <= 0 or received_quote <= 0:
             return 0.0
 
         realized = 0.0
-
         if self.position:
             base_qty = float(self.position.get("base_qty", 0.0))
             entry_cost = float(self.position.get("entry_cost_quote", 0.0))
@@ -624,113 +529,115 @@ class Bot:
                 if remaining_base <= 1e-9:
                     self._set_position(None)
                 else:
-                    # keep average entry price consistent with remaining cost
                     new_entry_price = remaining_cost / remaining_base if remaining_base > 0 else float(avg_price)
                     self.position["base_qty"] = float(remaining_base)
                     self.position["entry_cost_quote"] = float(remaining_cost)
                     self.position["entry_price"] = float(new_entry_price)
-                    # keep entry_ts as-is
                     self._set_position(self.position)
 
-        # trade record includes realized pnl (only meaningful when it reduces a position)
-        self.db.add_trade(ts, "SELL", float(avg_price), float(sold_base), float(received_quote), float(realized), mode)
+        self.db.add_trade(ts, "SELL", float(avg_price), float(sold_base), float(received_quote), float(realized), "LIVE")
         return realized
 
     # -------------------------
-    # LIVE: detect fills via balance deltas
+    # Order placement + fill handling (simplified)
     # -------------------------
 
-    def _sync_live_fills_from_balances(self, base_bal: float, quote_bal: float) -> None:
+    def _place_limit_buy_and_wait(self, amount_base: float, price: float) -> Tuple[float, float, float]:
         """
-        ✅ Improvement: If we have an open_order, infer a fill by checking balance changes
-        since the last loop and then write the trade + realized pnl.
-
-        This is "best effort" but works well for fully filled offers.
+        Places a LIMIT BUY for base, waits for fill (or cancels on TTL).
+        Returns (filled_base, spent_quote, avg_price).
         """
-        if not self.open_order:
-            self._set_last_bal(base_bal, quote_bal)
-            return
+        symbol = self.cfg.symbol
+        amount_base = round_amount_to_market(self.ex, symbol, amount_base)
+        price = round_price_to_market(self.ex, symbol, price)
+        if amount_base <= 0 or price <= 0:
+            return 0.0, 0.0, 0.0
 
-        prev = self.last_bal or {"base": base_bal, "quote": quote_bal}
-        prev_base = float(prev.get("base", base_bal))
-        prev_quote = float(prev.get("quote", quote_bal))
+        order = self.ex.create_limit_buy_order(symbol, amount_base, price)
+        oid = order["id"]
+        t_start = time.time()
 
-        d_base = base_bal - prev_base
-        d_quote = quote_bal - prev_quote
+        while True:
+            o = self.ex.fetch_order(oid, symbol)
+            status = (o.get("status") or "").lower()
+            filled = safe_float(o.get("filled"), 0.0)
+            cost = safe_float(o.get("cost"), 0.0)  # quote spent
+            avg = safe_float(o.get("average"), 0.0) or (cost / filled if filled > 0 else 0.0)
 
-        side = self.open_order.get("side")
-        # Small epsilon to avoid noise
-        eps = 1e-7
+            if status in ("closed",) or (filled > 0 and safe_float(o.get("remaining"), 0.0) == 0.0):
+                return filled, cost, avg
 
-        filled = False
-        ts = now_utc()
+            if time.time() - t_start > self.cfg.order_ttl_s:
+                try:
+                    self.ex.cancel_order(oid, symbol)
+                except Exception:
+                    pass
+                # re-fetch for partial fill info
+                o = self.ex.fetch_order(oid, symbol)
+                filled = safe_float(o.get("filled"), 0.0)
+                cost = safe_float(o.get("cost"), 0.0)
+                avg = safe_float(o.get("average"), 0.0) or (cost / filled if filled > 0 else 0.0)
+                return filled, cost, avg
 
-        if side == "BUY":
-            # BUY: base increases, quote decreases
-            got_base = d_base
-            spent_quote = -d_quote
-            if got_base > eps and spent_quote > eps:
-                avg_price = spent_quote / got_base
-                self._apply_buy_to_position(ts, got_base, spent_quote, avg_price, "LIVE")
-                filled = True
+            time.sleep(0.5)
 
-        elif side == "SELL":
-            # SELL: base decreases, quote increases
-            sold_base = -d_base
-            got_quote = d_quote
-            if sold_base > eps and got_quote > eps:
-                avg_price = got_quote / sold_base
-                realized = self._apply_sell_from_position(ts, sold_base, got_quote, avg_price, "LIVE")
-                filled = True
-                print(f"REALIZED (LIVE) = {realized:.6f} {self.cfg.quote_asset}")
+    def _place_limit_sell_and_wait(self, amount_base: float, price: float) -> Tuple[float, float, float]:
+        """
+        Places a LIMIT SELL for base, waits for fill (or cancels on TTL).
+        Returns (sold_base, received_quote, avg_price).
+        """
+        symbol = self.cfg.symbol
+        amount_base = round_amount_to_market(self.ex, symbol, amount_base)
+        price = round_price_to_market(self.ex, symbol, price)
+        if amount_base <= 0 or price <= 0:
+            return 0.0, 0.0, 0.0
 
-        if filled:
-            # Close the open_order state if it filled
-            self._set_open_order(None)
+        order = self.ex.create_limit_sell_order(symbol, amount_base, price)
+        oid = order["id"]
+        t_start = time.time()
 
-        # Always update last balances
-        self._set_last_bal(base_bal, quote_bal)
+        while True:
+            o = self.ex.fetch_order(oid, symbol)
+            status = (o.get("status") or "").lower()
+            filled = safe_float(o.get("filled"), 0.0)  # base sold
+            cost = safe_float(o.get("cost"), 0.0)      # quote received (for sells, cost is usually quote proceeds)
+            avg = safe_float(o.get("average"), 0.0) or (cost / filled if filled > 0 else 0.0)
+
+            if status in ("closed",) or (filled > 0 and safe_float(o.get("remaining"), 0.0) == 0.0):
+                return filled, cost, avg
+
+            if time.time() - t_start > self.cfg.order_ttl_s:
+                try:
+                    self.ex.cancel_order(oid, symbol)
+                except Exception:
+                    pass
+                o = self.ex.fetch_order(oid, symbol)
+                filled = safe_float(o.get("filled"), 0.0)
+                cost = safe_float(o.get("cost"), 0.0)
+                avg = safe_float(o.get("average"), 0.0) or (cost / filled if filled > 0 else 0.0)
+                return filled, cost, avg
+
+            time.sleep(0.5)
 
     # -------------------------
     # Trading logic
     # -------------------------
 
-    def _trade_live(self, bid: float, ask: float, base_bal: float, quote_bal: float) -> None:
-        # 1) Update fills first (so realized profit appears)
-        self._sync_live_fills_from_balances(base_bal, quote_bal)
-
-        # 2) Respect max_open_orders (your state is single open_order; keep it simple)
-        if self.open_order:
-            age = time.time() - float(self.open_order.get("ts", time.time()))
-            if age > self.cfg.order_ttl_s:
-                self._set_open_order(None)
-                return
-
-            cur_price = float(self.open_order.get("price", 0.0))
-            side = self.open_order.get("side")
-            target = (bid if side == "SELL" else ask)
-            if cur_price > 0:
-                move_bps = abs((target - cur_price) / cur_price) * 10000.0
-                if move_bps < self.cfg.requote_bps:
-                    return
-
-            # moved enough → drop state and place a fresh offer next loop
-            self._set_open_order(None)
-            return
-
-        # 3) If we have a position, try to exit for realized profit (even if spread isn't huge)
+    def _trade(self, bid: float, ask: float, base_bal: float, quote_bal: float) -> None:
+        # 1) Exit logic (realize profit)
         force_exit, reason = self._should_force_exit(bid)
         if self.position and force_exit and self._cooldown_ok():
-            base_qty = float(self.position.get("base_qty", 0.0))
-            base_qty = max(0.0, min(base_qty, base_bal))
-            if base_qty >= self.cfg.min_base_lot:
-                sell_price = bid  # more likely to fill (realize profit)
-                self._submit_sell_offer(base_qty, sell_price)
-                self._set_last_trade_ts(time.time())
-                self._set_open_order({"ts": time.time(), "side": "SELL", "price": sell_price, "qty": base_qty, "reason": reason})
+            pos_base = float(self.position.get("base_qty", 0.0))
+            sell_qty = min(pos_base, base_bal)
+            if sell_qty >= self.cfg.min_base_lot:
+                sold_base, got_quote, avg = self._place_limit_sell_and_wait(sell_qty, bid)
+                if sold_base > 0 and got_quote > 0:
+                    realized = self._apply_sell_from_position(now_utc(), sold_base, got_quote, avg)
+                    print(f"REALIZED = {realized:.6f} {self.cfg.quote_asset} ({reason})")
+                    self._set_last_trade_ts(time.time())
             return
 
-        # 4) Normal entry condition: only open a new position when spread is good
+        # 2) Entry logic (spread gate)
         if not self._cooldown_ok():
             return
 
@@ -738,50 +645,17 @@ class Bot:
         if spread_bps < self.cfg.min_spread_bps:
             return
 
-        # BUY at ask (more fill likelihood), only if no position (or you can allow scaling in)
-        if quote_bal >= self.cfg.trade_quote_amount and (not self.position):
+        # Only buy if no position (same as your code)
+        if (not self.position) and quote_bal >= self.cfg.trade_quote_amount:
             buy_price = ask
             base_qty = self.cfg.trade_quote_amount / max(buy_price, 1e-12)
             if base_qty < self.cfg.min_base_lot:
                 return
-            self._submit_buy_offer(base_qty, buy_price)
-            self._set_last_trade_ts(time.time())
-            self._set_open_order({"ts": time.time(), "side": "BUY", "price": buy_price, "qty": base_qty})
 
-    def _trade_sim(self, bid: float, ask: float) -> None:
-        # Exit logic first (to realize profit)
-        if self.position:
-            force_exit, _reason = self._should_force_exit(bid)
-            if force_exit and self._cooldown_ok():
-                base_qty = float(self.position.get("base_qty", 0.0))
-                base_qty = min(base_qty, self.sim_base)
-                if base_qty >= self.cfg.min_base_lot:
-                    # sell at bid
-                    quote_got = base_qty * bid
-                    self.sim_base -= base_qty
-                    self.sim_quote += quote_got
-                    realized = self._apply_sell_from_position(now_utc(), base_qty, quote_got, bid, "SIM")
-                    print(f"REALIZED (SIM) = {realized:.6f} {self.cfg.quote_asset}")
-                    self._set_last_trade_ts(time.time())
-                return
-
-        # Normal entry condition
-        if not self._cooldown_ok():
-            return
-
-        spread_bps = self._spread_bps(bid, ask)
-        if spread_bps < self.cfg.min_spread_bps:
-            return
-
-        # Only buy if no position (so profit is easier to track/realize)
-        if not self.position and self.sim_quote >= self.cfg.trade_quote_amount:
-            base_qty = self.cfg.trade_quote_amount / ask  # conservative fill
-            if base_qty < self.cfg.min_base_lot:
-                return
-            self.sim_quote -= self.cfg.trade_quote_amount
-            self.sim_base += base_qty
-            self._apply_buy_to_position(now_utc(), base_qty, self.cfg.trade_quote_amount, ask, "SIM")
-            self._set_last_trade_ts(time.time())
+            filled_base, spent_quote, avg = self._place_limit_buy_and_wait(base_qty, buy_price)
+            if filled_base > 0 and spent_quote > 0:
+                self._apply_buy_to_position(now_utc(), filled_base, spent_quote, avg)
+                self._set_last_trade_ts(time.time())
 
     # -------------------------
     # Loop
@@ -792,43 +666,27 @@ class Bot:
         while True:
             t0 = time.time()
             try:
-                bid, ask = fetch_best_bid_ask(self.server, self.base_asset, self.quote_asset)
+                bid, ask = fetch_best_bid_ask(self.ex, self.cfg.symbol)
                 spread_bps = self._spread_bps(bid, ask)
 
-                if self.cfg.is_live:
-                    base_bal, quote_bal = fetch_balances(self.server, self.cfg)
-                    self._trade_live(bid, ask, base_bal, quote_bal)
-                    # refresh balances after potential fills/submit
-                    base_bal, quote_bal = fetch_balances(self.server, self.cfg)
-                else:
-                    base_bal, quote_bal = self.sim_base, self.sim_quote
-                    self._trade_sim(bid, ask)
-                    base_bal, quote_bal = self.sim_base, self.sim_quote
+                base_bal, quote_bal = fetch_balances(self.ex, self.cfg.base_asset, self.cfg.quote_asset)
+
+                self._trade(bid, ask, base_bal, quote_bal)
+
+                # refresh balances after trade
+                base_bal, quote_bal = fetch_balances(self.ex, self.cfg.base_asset, self.cfg.quote_asset)
 
                 self._maybe_snapshot(bid, ask, spread_bps, base_bal, quote_bal)
 
-                open_order_str = "none"
-                if self.open_order:
-                    side = self.open_order.get("side")
-                    price = float(self.open_order.get("price"))
-                    qty = float(self.open_order.get("qty"))
-                    age = int(time.time() - float(self.open_order.get("ts", time.time())))
-                    reason = self.open_order.get("reason")
-                    if reason:
-                        open_order_str = f"{side}@{price:.7f} qty={qty:.6f} age={age}s ({reason})"
-                    else:
-                        open_order_str = f"{side}@{price:.7f} qty={qty:.6f} age={age}s"
-
                 print(
-                    f"TICK bid={bid:.7f} ask={ask:.7f} "
+                    f"TICK bid={bid:.6f} ask={ask:.6f} "
                     f"spread={spread_bps/100:.4f}% "
                     f"bal{self.cfg.quote_asset}={quote_bal:.2f} "
                     f"bal{self.cfg.base_asset}={base_bal:.6f}"
                 )
 
-                # Print report roughly every snapshot interval boundary
                 if int(time.time()) % max(self.cfg.snapshot_interval_s, 1) == 0:
-                    self._report(bid, ask, base_bal, quote_bal, open_order_str)
+                    self._report(bid, ask, base_bal, quote_bal, "none")
 
             except Exception as e:
                 print("ERROR:", str(e))
@@ -846,4 +704,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
